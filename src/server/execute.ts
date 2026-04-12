@@ -12,6 +12,7 @@ import type * as k8s from "@kubernetes/client-node";
 import { Writable } from "node:stream";
 
 const POLL_INTERVAL_MS = 2000;
+const KEEPALIVE_INTERVAL_MS = 15_000;
 
 /**
  * Wait for the Job's pod to reach a terminal or running state.
@@ -331,6 +332,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let stdout = "";
   let exitCode: number | null = null;
   let jobTimedOut = false;
+  let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
   try {
     // Wait for pod to be ready for log streaming
@@ -357,8 +359,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // 0 = no timeout (run indefinitely, matching claude_local behavior)
     const completionTimeoutMs = timeoutSec > 0 ? (timeoutSec + graceSec) * 1000 : 0;
 
+    // Keepalive: periodically send a status line via onLog so the
+    // Paperclip server knows the adapter is still alive even when the
+    // pod produces no output (e.g. Claude is in a long thinking phase).
+    let lastLogAt = Date.now();
+    keepaliveTimer = setInterval(() => {
+      const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
+      void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`);
+    }, KEEPALIVE_INTERVAL_MS);
+    const wrappedOnLog: typeof onLog = async (stream, chunk) => {
+      lastLogAt = Date.now();
+      return onLog(stream, chunk);
+    };
+
     const [logResult, completionResult] = await Promise.allSettled([
-      streamPodLogs(namespace, podName, onLog, kubeconfigPath),
+      streamPodLogs(namespace, podName, wrappedOnLog, kubeconfigPath),
       waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath),
     ]);
 
@@ -384,6 +399,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     exitCode = await getPodExitCode(namespace, jobName, kubeconfigPath);
   } finally {
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
     if (!retainJobs) {
       await cleanupJob(namespace, jobName, onLog, kubeconfigPath);
     } else {
