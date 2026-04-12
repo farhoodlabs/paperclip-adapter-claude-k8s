@@ -186,7 +186,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   const agentSlug = sanitizeForK8sName(agent.id);
   const runSlug = sanitizeForK8sName(runId);
-  const jobName = `agent-${agentSlug}-${runSlug}`;
+  const jobName = `agent-claude-${agentSlug}-${runSlug}`;
 
   // Build prompt (same logic as claude_local)
   const promptTemplate = asString(
