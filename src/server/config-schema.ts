@@ -23,8 +23,17 @@ interface AdapterConfigSchema {
 }
 
 export function getConfigSchema(): AdapterConfigSchema {
+  // model, effort, instructionsFilePath, timeoutSec, graceSec are provided
+  // by the platform UI and must not be duplicated here.
   const fields: ConfigFieldSchema[] = [
     // Core Claude fields
+    {
+      type: "number",
+      key: "maxTurnsPerRun",
+      label: "Max Turns Per Run",
+      hint: "Maximum number of agentic turns (tool calls) per heartbeat run. 0 means unlimited.",
+      default: 1000,
+    },
     {
       type: "toggle",
       key: "dangerouslySkipPermissions",
