@@ -47,6 +47,14 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: "npm"
 
-      - run: npm publish --access public
+      - name: Publish (skip if version already exists)
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null; then
+            echo "Version ${PKG_VERSION} already published — skipping."
+          else
+            npm publish --access public
+          fi
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
