@@ -6,14 +6,6 @@ export const models = [
     { id: "claude-haiku-4-6", label: "Claude Haiku 4.6" },
     { id: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5" },
     { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-    // AWS Bedrock US inference profile IDs
-    { id: "us.anthropic.claude-opus-4-6-v1", label: "Bedrock Opus 4.6" },
-    { id: "us.anthropic.claude-sonnet-4-6", label: "Bedrock Sonnet 4.6" },
-    { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", label: "Bedrock Opus 4.5" },
-    { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", label: "Bedrock Sonnet 4.5" },
-    { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", label: "Bedrock Haiku 4.5" },
-    { id: "us.anthropic.claude-opus-4-1-20250805-v1:0", label: "Bedrock Opus 4.1" },
-    { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", label: "Bedrock Sonnet 4" },
 ];
 export const agentConfigurationDoc = `# claude_k8s agent configuration
 
@@ -49,8 +41,7 @@ Operational fields:
 - graceSec (number, optional): additional grace before adapter gives up after Job deadline
 
 Inherited from Deployment (no config needed):
-- CLAUDE_CODE_USE_BEDROCK, AWS_REGION, AWS_BEARER_TOKEN_BEDROCK
-- ANTHROPIC_API_KEY, OPENAI_API_KEY
+- ANTHROPIC_API_KEY, OPENAI_API_KEY, and other provider API keys
 - PAPERCLIP_API_URL
 - Container image, imagePullSecrets, DNS config, PVC mount, security context
 
@@ -60,4 +51,5 @@ Notes:
 - Prompts are delivered via a busybox init container writing to an emptyDir volume
 `;
 export { createServerAdapter } from "./server/index.js";
+export { printClaudeStreamEvent } from "./cli/index.js";
 //# sourceMappingURL=index.js.map

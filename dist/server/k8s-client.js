@@ -1,14 +1,5 @@
 import * as k8s from "@kubernetes/client-node";
 import { readFileSync } from "node:fs";
-/** Keys forwarded from the Deployment container env into Job pods. */
-const INHERITED_ENV_KEYS = [
-    "CLAUDE_CODE_USE_BEDROCK",
-    "AWS_REGION",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "PAPERCLIP_API_URL",
-];
 let cachedSelfPod = null;
 /**
  * Cache keyed by kubeconfig path (empty string = in-cluster).
@@ -103,13 +94,15 @@ export async function getSelfPodInfo(kubeconfigPath) {
             });
         }
     }
-    // Collect inherited env vars from process.env (these came from the Deployment spec)
+    // Collect env vars from the pod spec's container definition.
+    // Agent config env (set in buildEnvVars) will override these.
     const inheritedEnv = {};
-    for (const key of INHERITED_ENV_KEYS) {
-        const value = process.env[key];
-        if (value !== undefined) {
-            inheritedEnv[key] = value;
-        }
+    for (const envItem of mainContainer.env ?? []) {
+        if (!envItem.name)
+            continue;
+        const value = envItem.value ?? "";
+        if (value)
+            inheritedEnv[envItem.name] = value;
     }
     cachedSelfPod = {
         namespace,

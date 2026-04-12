@@ -26,60 +26,11 @@ export function getConfigSchema(): AdapterConfigSchema {
   const fields: ConfigFieldSchema[] = [
     // Core Claude fields
     {
-      type: "select",
-      key: "model",
-      label: "Model",
-      hint: "Claude model to use for this agent.",
-      options: [
-        { value: "claude-opus-4-6", label: "Claude Opus 4.6" },
-        { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-        { value: "claude-haiku-4-6", label: "Claude Haiku 4.6" },
-        { value: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5" },
-        { value: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-      ],
-    },
-    {
-      type: "select",
-      key: "effort",
-      label: "Reasoning Effort",
-      hint: "Reasoning effort level passed via --effort.",
-      options: [
-        { value: "low", label: "Low" },
-        { value: "medium", label: "Medium" },
-        { value: "high", label: "High" },
-      ],
-    },
-    {
-      type: "number",
-      key: "maxTurnsPerRun",
-      label: "Max Turns Per Run",
-      hint: "Maximum number of turns for a single run. 0 means unlimited.",
-    },
-    {
       type: "toggle",
       key: "dangerouslySkipPermissions",
       label: "Skip Permissions",
       hint: "Pass --dangerously-skip-permissions to Claude. Enabled by default for unattended K8s Jobs.",
       default: true,
-    },
-    {
-      type: "text",
-      key: "instructionsFilePath",
-      label: "Instructions File Path",
-      hint: "Absolute path to a markdown instructions file injected at runtime via --append-system-prompt-file.",
-    },
-    // Operational
-    {
-      type: "number",
-      key: "timeoutSec",
-      label: "Timeout (seconds)",
-      hint: "Run timeout in seconds. 0 means no timeout.",
-    },
-    {
-      type: "number",
-      key: "graceSec",
-      label: "Grace Period (seconds)",
-      hint: "Additional grace period before adapter gives up after Job deadline. Default: 60.",
     },
     // Kubernetes
     {

@@ -140,7 +140,7 @@ export function buildJobManifest(input) {
     const workingDir = workspaceCwd || configuredCwd || "/paperclip";
     const agentSlug = sanitizeForK8sName(agent.id);
     const runSlug = sanitizeForK8sName(runId);
-    const jobName = `agent-${agentSlug}-${runSlug}`;
+    const jobName = `agent-claude-${agentSlug}-${runSlug}`;
     // Build prompt (same logic as claude_local)
     const promptTemplate = asString(config.promptTemplate, "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.");
     const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
@@ -269,6 +269,7 @@ export function buildJobManifest(input) {
         runAsUser: 1000,
         runAsGroup: 1000,
         fsGroup: 1000,
+        fsGroupChangePolicy: "OnRootMismatch",
     };
     // Build the claude command string for the main container
     const claudeArgsEscaped = claudeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
