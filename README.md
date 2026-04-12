@@ -44,7 +44,7 @@ See the agent configuration documentation for all available fields:
 ## Requirements
 
 - Kubernetes cluster with RBAC permissions to create Jobs, list Pods, and read Pod logs
-- Shared RWX PVC mounted at `/paperclip` for session resume and workspace access
+- **Paperclip must be deployed on a RWX PVC** mounted at `/paperclip` — this shared volume is required for session resume and workspace access
 - `@paperclipai/adapter-utils` >= 0.3.0
 
 ## License
