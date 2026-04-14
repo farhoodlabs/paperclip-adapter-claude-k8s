@@ -148,6 +148,10 @@ function buildEnvVars(
   // HOME must be /paperclip to match PVC mount and enable session resume
   merged.HOME = "/paperclip";
 
+  if (asBoolean(config.enableRtk, false)) {
+    merged.RTK_NO_TELEMETRY = "1";
+  }
+
   // Convert to V1EnvVar array
   const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => ({
     name,
@@ -171,6 +175,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // K8s Job pods are always unattended — no one to approve permission prompts
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const extraArgs = asStringArray(config.extraArgs);
+  const enableRtk = asBoolean(config.enableRtk, false);
+  const rtkVersion = asString(config.rtkVersion, "latest");
+  const rtkImage = asString(config.rtkImage, "curlimages/curl:8.12.1");
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const resources = parseObject(config.resources);
@@ -282,6 +289,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   ];
 
+  if (enableRtk) {
+    volumes.push({ name: "rtk-bin", emptyDir: {} });
+    volumeMounts.push({ name: "rtk-bin", mountPath: "/tmp/rtk-bin" });
+  }
+
   // Mount shared PVC for /paperclip (session state, workspaces, data)
   if (selfPod.pvcClaimName) {
     volumes.push({
@@ -326,7 +338,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Build the claude command string for the main container
   const claudeArgsEscaped = claudeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
-  const mainCommand = `cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped}`;
+  const claudeCommand = `cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped}`;
+  const mainCommand = enableRtk
+    ? `export PATH="/tmp/rtk-bin:$PATH" && _RTK_HOME=$(mktemp -d) && HOME="$_RTK_HOME" rtk install claude-code 2>/dev/null && mkdir -p '${workingDir}/.claude' && mv "$_RTK_HOME/.claude/settings.json" '${workingDir}/.claude/settings.local.json' 2>/dev/null; rm -rf "$_RTK_HOME"; export HOME=/paperclip && ${claudeCommand}`
+    : claudeCommand;
 
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
@@ -368,6 +383,28 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 limits: { cpu: "100m", memory: "64Mi" },
               },
             },
+            ...(enableRtk
+              ? [
+                  {
+                    name: "install-rtk",
+                    image: rtkImage,
+                    imagePullPolicy: "IfNotPresent" as const,
+                    command: [
+                      "sh",
+                      "-c",
+                      rtkVersion === "latest"
+                        ? "curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | RTK_INSTALL_DIR=/tmp/rtk-bin sh"
+                        : `curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | RTK_INSTALL_DIR=/tmp/rtk-bin RTK_VERSION=${rtkVersion} sh`,
+                    ],
+                    volumeMounts: [{ name: "rtk-bin", mountPath: "/tmp/rtk-bin" }],
+                    securityContext,
+                    resources: {
+                      requests: { cpu: "10m", memory: "32Mi" },
+                      limits: { cpu: "200m", memory: "128Mi" },
+                    },
+                  },
+                ]
+              : []),
           ],
           containers: [
             {

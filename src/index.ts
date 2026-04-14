@@ -38,6 +38,11 @@ Kubernetes fields:
 - ttlSecondsAfterFinished (number, optional): auto-cleanup delay; default 300
 - retainJobs (boolean, optional): skip cleanup on completion for debugging
 
+RTK fields (token optimization):
+- enableRtk (boolean, optional): enable RTK to reduce token usage by filtering CLI output. Configures Claude Code PreToolUse/PostToolUse hooks automatically via project-level settings. Adds an init container to download the RTK binary.
+- rtkVersion (string, optional): RTK version to install; defaults to "latest"
+- rtkImage (string, optional): container image for the RTK download init container; defaults to "curlimages/curl:8.12.1"
+
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds; 0 means no timeout
 - graceSec (number, optional): additional grace before adapter gives up after Job deadline

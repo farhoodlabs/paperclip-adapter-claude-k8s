@@ -108,6 +108,26 @@ export function getConfigSchema(): AdapterConfigSchema {
       label: "Memory Limit",
       hint: "Memory limit for Job pods (e.g. 128Mi, 512Mi, 1Gi).",
     },
+    // RTK (token optimization)
+    {
+      type: "toggle",
+      key: "enableRtk",
+      label: "Enable RTK",
+      hint: "Install and enable RTK (rtk-ai/rtk) to reduce token usage by filtering CLI output through PreToolUse/PostToolUse hooks. Adds an init container to download the RTK binary.",
+      default: false,
+    },
+    {
+      type: "text",
+      key: "rtkVersion",
+      label: "RTK Version",
+      hint: "RTK version to install (e.g. '0.5.0'). Defaults to 'latest'.",
+    },
+    {
+      type: "text",
+      key: "rtkImage",
+      label: "RTK Installer Image",
+      hint: "Container image for the RTK download init container. Defaults to curlimages/curl:8.12.1.",
+    },
     // Scheduling
     {
       type: "textarea",
