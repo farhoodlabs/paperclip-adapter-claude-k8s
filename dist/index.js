@@ -36,6 +36,10 @@ Kubernetes fields:
 - ttlSecondsAfterFinished (number, optional): auto-cleanup delay; default 300
 - retainJobs (boolean, optional): skip cleanup on completion for debugging
 
+RTK fields (token optimization):
+- enableRtk (boolean, optional): install and enable RTK to reduce token usage by filtering command output (~80% reduction). Adds an init container to download the RTK binary from GitHub.
+- rtkVersion (string, optional): RTK version to install; defaults to "latest"
+
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds; 0 means no timeout
 - graceSec (number, optional): additional grace before adapter gives up after Job deadline

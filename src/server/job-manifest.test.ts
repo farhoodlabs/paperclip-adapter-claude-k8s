@@ -497,6 +497,96 @@ describe("buildJobManifest", () => {
     });
   });
 
+  describe("RTK integration", () => {
+    it("does not add RTK init container by default", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const inits = job.spec?.template?.spec?.initContainers ?? [];
+      expect(inits).toHaveLength(1);
+      expect(inits[0]?.name).toBe("write-prompt");
+    });
+
+    it("adds install-rtk init container when enableRtk is true", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const inits = job.spec?.template?.spec?.initContainers ?? [];
+      expect(inits).toHaveLength(2);
+      expect(inits[1]?.name).toBe("install-rtk");
+      expect(inits[1]?.image).toBe("curlimages/curl:8.12.1");
+    });
+
+    it("adds rtk-bin emptyDir volume when enableRtk is true", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const rtkVol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "rtk-bin");
+      expect(rtkVol?.emptyDir).toEqual({});
+    });
+
+    it("mounts rtk-bin in main container when enableRtk is true", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const rtkMount = job.spec?.template?.spec?.containers[0]?.volumeMounts?.find(
+        (vm) => vm.name === "rtk-bin",
+      );
+      expect(rtkMount?.mountPath).toBe("/tmp/rtk-bin");
+    });
+
+    it("prepends rtk setup to main command when enableRtk is true", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command;
+      expect(command?.[2]).toContain("export PATH=\"/tmp/rtk-bin:$PATH\"");
+      expect(command?.[2]).toContain("rtk install claude-code");
+      expect(command?.[2]).toContain("cat /tmp/prompt/prompt.txt | claude");
+    });
+
+    it("does not prepend rtk setup when enableRtk is false", () => {
+      ctx.config = { enableRtk: false };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command;
+      expect(command?.[2]).not.toContain("rtk");
+      expect(command?.[2]).toMatch(/^cat \/tmp\/prompt\/prompt\.txt/);
+    });
+
+    it("does not add rtk-bin volume when enableRtk is false", () => {
+      ctx.config = { enableRtk: false };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.volumes?.find((v) => v.name === "rtk-bin")).toBeUndefined();
+    });
+
+    it("sets RTK_NO_TELEMETRY env var when enableRtk is true", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const rtkTelemetry = job.spec?.template?.spec?.containers[0]?.env?.find(
+        (e) => e.name === "RTK_NO_TELEMETRY",
+      );
+      expect(rtkTelemetry?.value).toBe("1");
+    });
+
+    it("does not set RTK_NO_TELEMETRY when enableRtk is false", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const rtkTelemetry = job.spec?.template?.spec?.containers[0]?.env?.find(
+        (e) => e.name === "RTK_NO_TELEMETRY",
+      );
+      expect(rtkTelemetry).toBeUndefined();
+    });
+
+    it("uses custom rtkVersion in install command", () => {
+      ctx.config = { enableRtk: true, rtkVersion: "0.5.0" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const inits = job.spec?.template?.spec?.initContainers ?? [];
+      const rtkInit = inits.find((c) => c.name === "install-rtk");
+      expect(rtkInit?.command?.[2]).toContain("RTK_VERSION=0.5.0");
+    });
+
+    it("mounts rtk-bin in install-rtk init container", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const inits = job.spec?.template?.spec?.initContainers ?? [];
+      const rtkInit = inits.find((c) => c.name === "install-rtk");
+      expect(rtkInit?.volumeMounts).toContainEqual({ name: "rtk-bin", mountPath: "/tmp/rtk-bin" });
+    });
+  });
+
   describe("return value", () => {
     it("returns job, jobName, namespace, prompt, claudeArgs, promptMetrics", () => {
       const result = buildJobManifest({ ctx, selfPod });
