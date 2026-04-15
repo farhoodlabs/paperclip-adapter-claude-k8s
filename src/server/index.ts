@@ -30,6 +30,9 @@ export function createServerAdapter(): ServerAdapterModule {
     listSkills: listK8sSkills,
     syncSkills: syncK8sSkills,
     supportsLocalAgentJwt: true,
+    supportsInstructionsBundle: true,
+    instructionsPathKey: "instructionsFilePath",
+    requiresMaterializedRuntimeSkills: false,
     agentConfigurationDoc,
     getConfigSchema,
   };
