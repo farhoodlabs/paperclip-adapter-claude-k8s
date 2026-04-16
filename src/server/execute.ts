@@ -387,6 +387,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
+
+      // Notify the server that execution has started. Without this call,
+      // the server has no processStartedAt timestamp for the run, so the
+      // stale-run reaper (reapOrphanedRuns) cannot distinguish a live K8s
+      // job from an orphaned run and may mark it as failed — causing the
+      // UI to show no active runs and triggering duplicate run attempts.
+      if (ctx.onSpawn) {
+        await ctx.onSpawn({
+          pid: -1,              // no local process; sentinel for K8s Job
+          processGroupId: null,
+          startedAt: new Date().toISOString(),
+        });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await onLog("stderr", `[paperclip] Pod scheduling failed: ${msg}\n`);
