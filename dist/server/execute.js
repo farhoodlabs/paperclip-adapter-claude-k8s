@@ -364,11 +364,41 @@ export async function execute(ctx) {
                 await onLog("stdout", stdout);
             }
         }
+        // If the follow stream missed output (container exited quickly), do a
+        // one-shot log read as fallback before the pod is cleaned up.
+        if (!stdout.trim()) {
+            await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
+            stdout = await readPodLogs(namespace, podName, kubeconfigPath);
+            if (stdout.trim()) {
+                await onLog("stdout", stdout);
+            }
+        }
         if (completionResult.status === "fulfilled") {
             jobTimedOut = completionResult.value.timedOut;
         }
         else {
-            jobTimedOut = true;
+            // waitForJobCompletion threw — re-check job state to avoid returning
+            // while the job is still running (which would cause UI staleness and
+            // concurrency errors on retry).
+            jobTimedOut = false;
+            const actualState = await waitForJobCompletion(namespace, jobName, 0, kubeconfigPath);
+            if (actualState.timedOut) {
+                // Truly a timeout after re-check — treat as timed out.
+                jobTimedOut = true;
+            }
+            else if (!actualState.succeeded) {
+                // Job still not terminal — the completion error was likely transient.
+                // Return an error so the UI knows the run is not done, rather than
+                // returning with parsed (potentially incomplete) stdout.
+                await onLog("stderr", `[paperclip] Job ${jobName} still not terminal after log/completion mismatch — returning error to keep UI in sync.\n`);
+                return {
+                    exitCode,
+                    signal: null,
+                    timedOut: false,
+                    errorMessage: `Job ${jobName} did not complete cleanly (log stream ended before job reached terminal state)`,
+                    errorCode: "k8s_job_state_mismatch",
+                };
+            }
         }
         exitCode = await getPodExitCode(namespace, jobName, kubeconfigPath);
     }
