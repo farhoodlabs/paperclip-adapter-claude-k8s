@@ -141,6 +141,19 @@ more raw output`;
     expect(result.summary).toContain("JSON output");
     expect(result.summary).not.toContain("some raw output");
   });
+
+  it("deduplicates identical assistant text blocks from reconnect replays", () => {
+    const assistantEvent = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "Hello world" }] },
+    });
+    // Simulate the same assistant event appearing twice (log stream reconnect replay)
+    const stdout = `${assistantEvent}\n${assistantEvent}\n`;
+    const result = parseClaudeStreamJson(stdout);
+    expect(result.summary).toBe("Hello world");
+    // Should not be "Hello world\n\nHello world"
+    expect(result.summary.split("Hello world").length).toBe(2);
+  });
 });
 
 describe("extractClaudeLoginUrl", () => {

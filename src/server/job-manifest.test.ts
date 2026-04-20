@@ -40,25 +40,44 @@ describe("buildJobManifest", () => {
   });
 
   describe("job naming", () => {
-    it("uses agent-claude- prefix", () => {
+    it("uses ac- prefix", () => {
       const { jobName } = buildJobManifest({ ctx, selfPod });
-      expect(jobName).toMatch(/^agent-claude-/);
+      expect(jobName).toMatch(/^ac-/);
     });
 
-    it("includes sanitized agent id slug", () => {
+    it("includes sanitized agent id slug (up to 16 chars)", () => {
       ctx.agent.id = "Agent-ABC!@#";
       const { jobName } = buildJobManifest({ ctx, selfPod });
-      // sanitizeForK8sName: lowercase, strip non-alphanumeric (not dashes), slice 0-8
-      // "Agent-ABC!@#" -> "agent-abc" (strips !@#, slice to 8 = "agent-ab")
-      expect(jobName).toContain("agent-ab");
+      // sanitizeForK8sName: lowercase, strip non-alphanumeric (not dashes), slice 0-16
+      expect(jobName).toContain("agent-abc");
     });
 
-    it("includes sanitized run id slug", () => {
+    it("includes sanitized run id slug (up to 16 chars)", () => {
       ctx.runId = "RUN-ABC-12345";
       const { jobName } = buildJobManifest({ ctx, selfPod });
-      // sanitizeForK8sName: lowercase, strip non-alphanumeric (not dashes), slice 0-8
-      // "RUN-ABC-12345" -> "run-abc-12345" (slice to 8 = "run-abc-")
-      expect(jobName).toContain("run-abc-");
+      expect(jobName).toContain("run-abc-12345");
+    });
+
+    it("includes a deterministic hash suffix", () => {
+      const result1 = buildJobManifest({ ctx, selfPod });
+      const result2 = buildJobManifest({ ctx, selfPod });
+      expect(result1.jobName).toBe(result2.jobName);
+      // Hash suffix is 6 hex chars at the end
+      expect(result1.jobName).toMatch(/-[0-9a-f]{6}$/);
+    });
+
+    it("different agent+run pairs produce different names", () => {
+      const result1 = buildJobManifest({ ctx, selfPod });
+      ctx.runId = "run-different";
+      const result2 = buildJobManifest({ ctx, selfPod });
+      expect(result1.jobName).not.toBe(result2.jobName);
+    });
+
+    it("stays within 63-char DNS label limit", () => {
+      ctx.agent.id = "a".repeat(100);
+      ctx.runId = "r".repeat(100);
+      const { jobName } = buildJobManifest({ ctx, selfPod });
+      expect(jobName.length).toBeLessThanOrEqual(63);
     });
   });
 
@@ -544,7 +563,7 @@ describe("buildJobManifest", () => {
   });
 
   describe("return value", () => {
-    it("returns job, jobName, namespace, prompt, claudeArgs, promptMetrics", () => {
+    it("returns job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret", () => {
       const result = buildJobManifest({ ctx, selfPod });
       expect(result.job).toBeDefined();
       expect(result.jobName).toBeDefined();
@@ -552,6 +571,74 @@ describe("buildJobManifest", () => {
       expect(result.prompt).toBeDefined();
       expect(result.claudeArgs).toBeDefined();
       expect(result.promptMetrics).toBeDefined();
+      expect(result.promptSecret).toBeNull();
+    });
+  });
+
+  describe("nodeSelector key=value parsing", () => {
+    it("parses key=value multiline text", () => {
+      ctx.config = { nodeSelector: "disktype=ssd\ntopology.kubernetes.io/zone=us-east-1a" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.nodeSelector).toEqual({
+        disktype: "ssd",
+        "topology.kubernetes.io/zone": "us-east-1a",
+      });
+    });
+
+    it("still accepts JSON objects", () => {
+      ctx.config = { nodeSelector: { disktype: "ssd" } };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.nodeSelector).toEqual({ disktype: "ssd" });
+    });
+
+    it("parses JSON string format", () => {
+      ctx.config = { nodeSelector: '{"disktype":"ssd"}' };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.nodeSelector).toEqual({ disktype: "ssd" });
+    });
+
+    it("skips comment lines and blank lines", () => {
+      ctx.config = { nodeSelector: "# comment\n\ndisktype=ssd\n" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.nodeSelector).toEqual({ disktype: "ssd" });
+    });
+  });
+
+  describe("labels key=value parsing", () => {
+    it("parses key=value multiline text for extra labels", () => {
+      ctx.config = { labels: "env=prod\nteam=platform" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.metadata?.labels?.env).toBe("prod");
+      expect(job.metadata?.labels?.team).toBe("platform");
+    });
+  });
+
+  describe("large prompt Secret fallback", () => {
+    it("returns null promptSecret for small prompts", () => {
+      const { promptSecret } = buildJobManifest({ ctx, selfPod });
+      expect(promptSecret).toBeNull();
+    });
+
+    it("returns promptSecret for prompts >256 KiB", () => {
+      // Build a prompt >256 KiB via a custom template
+      const largePrompt = "x".repeat(300 * 1024);
+      ctx.config = { promptTemplate: largePrompt };
+      const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
+      expect(promptSecret).not.toBeNull();
+      expect(promptSecret!.data["prompt.txt"]).toBe(largePrompt);
+      // Init container should copy from secret volume, not use PROMPT_CONTENT env
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      expect(init?.command).toContainEqual(expect.stringContaining("cp"));
+      expect(init?.env).toBeUndefined();
+      // Should have prompt-secret volume
+      const secretVol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "prompt-secret");
+      expect(secretVol?.secret?.secretName).toBe(promptSecret!.name);
+    });
+
+    it("uses env var init container for small prompts", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      expect(init?.env?.[0]?.name).toBe("PROMPT_CONTENT");
     });
   });
 });

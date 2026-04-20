@@ -9,6 +9,11 @@ import {
   buildPaperclipEnv,
   renderTemplate,
 } from "@paperclipai/adapter-utils/server-utils";
+import { createHash } from "node:crypto";
+
+/** Prompts above this size (bytes) are staged via a Secret instead of an
+ *  init container env var, protecting against the ~1 MiB PodSpec limit. */
+const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
 
 // Inline prompt assembly — these functions are not yet in the published adapter-utils
 function joinPromptSections(sections: string[], separator = "\n\n"): string {
@@ -44,9 +49,61 @@ function renderPaperclipWakePrompt(wake: unknown, _opts?: { resumedSession?: boo
 }
 import type { SelfPodInfo } from "./k8s-client.js";
 
+/**
+ * Parse a config value that may be either a JSON object or multiline
+ * `key=value` text (one pair per line).  This fixes the config-hint
+ * parity issue where textarea hints promise `key=value` per line but
+ * `parseObject` only handles JSON.
+ */
+function parseKeyValueConfig(raw: unknown): Record<string, string> {
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    // Already an object (JSON was parsed upstream)
+    const result: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "string") result[k] = v;
+    }
+    return result;
+  }
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  // Try JSON parse first
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      const result: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof v === "string") result[k] = v;
+      }
+      return result;
+    }
+  } catch {
+    // Not JSON — fall through to key=value parsing
+  }
+  // Parse key=value lines
+  const result: Record<string, string> = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx <= 0) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const value = trimmed.slice(eqIdx + 1).trim();
+    if (key) result[key] = value;
+  }
+  return result;
+}
+
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
+}
+
+/** When the prompt exceeds the env-var size limit, the manifest uses a
+ *  Secret-backed volume instead of the init container's PROMPT_CONTENT env.
+ *  The caller must create this Secret before the Job and clean it up after. */
+export interface PromptSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
 }
 
 export interface JobBuildResult {
@@ -56,10 +113,21 @@ export interface JobBuildResult {
   prompt: string;
   claudeArgs: string[];
   promptMetrics: Record<string, number>;
+  /** Non-null when the prompt is too large for an env var and must be
+   *  staged as a K8s Secret before creating the Job. */
+  promptSecret: PromptSecret | null;
 }
 
-function sanitizeForK8sName(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 8);
+function sanitizeForK8sName(value: string, maxLen = 16): string {
+  return value.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, maxLen);
+}
+
+/**
+ * Build a short deterministic hash suffix from the raw inputs to avoid
+ * collisions when sanitized slugs happen to be identical.
+ */
+function shortHash(input: string, len = 6): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, len);
 }
 
 function buildEnvVars(
@@ -184,9 +252,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const resources = parseObject(config.resources);
-  const nodeSelector = parseObject(config.nodeSelector);
+  const nodeSelector = parseKeyValueConfig(config.nodeSelector);
   const tolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
-  const extraLabels = parseObject(config.labels);
+  const extraLabels = parseKeyValueConfig(config.labels);
 
   // Resolve working directory — use workspace cwd, fall back to /paperclip
   const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -194,9 +262,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const configuredCwd = asString(config.cwd, "");
   const workingDir = workspaceCwd || configuredCwd || "/paperclip";
 
-  const agentSlug = sanitizeForK8sName(agent.id);
-  const runSlug = sanitizeForK8sName(runId);
-  const jobName = `agent-claude-${agentSlug}-${runSlug}`;
+  // Build a deterministic, collision-resistant job name within the 63-char
+  // DNS label limit.  Layout: "ac-{agentSlug}-{runSlug}-{hash}" where the
+  // hash is derived from the raw (un-truncated) agent+run IDs.
+  const agentSlug = sanitizeForK8sName(agent.id, 16);
+  const runSlug = sanitizeForK8sName(runId, 16);
+  const hash = shortHash(`${agent.id}:${runId}`);
+  const jobName = `ac-${agentSlug}-${runSlug}-${hash}`;
 
   // Build prompt (same logic as claude_local)
   const promptTemplate = asString(
@@ -275,7 +347,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     "paperclip.io/adapter-type": "claude_k8s",
   };
   for (const [key, value] of Object.entries(extraLabels)) {
-    if (typeof value === "string") labels[key] = value;
+    labels[key] = value;
   }
 
   // Volumes
@@ -338,6 +410,57 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const claudeArgsEscaped = claudeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
   const mainCommand = `cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped}`;
 
+  // Decide prompt delivery strategy: env var (small) or Secret volume (large).
+  const promptBytes = Buffer.byteLength(prompt, "utf-8");
+  const useLargePromptPath = promptBytes > LARGE_PROMPT_THRESHOLD_BYTES;
+  let promptSecret: PromptSecret | null = null;
+  const promptSecretName = `${jobName}-prompt`;
+
+  if (useLargePromptPath) {
+    // Stage prompt as a Secret; the init container copies from the mounted
+    // secret volume to the emptyDir so the main container reads it the
+    // same way regardless of prompt size.
+    promptSecret = {
+      name: promptSecretName,
+      namespace,
+      data: { "prompt.txt": prompt },
+    };
+    volumes.push({
+      name: "prompt-secret",
+      secret: { secretName: promptSecretName, optional: false },
+    });
+  }
+
+  const initContainer: k8s.V1Container = useLargePromptPath
+    ? {
+        name: "write-prompt",
+        image: "busybox:1.36",
+        imagePullPolicy: "IfNotPresent",
+        command: ["sh", "-c", "cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt"],
+        volumeMounts: [
+          { name: "prompt", mountPath: "/tmp/prompt" },
+          { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
+        ],
+        securityContext,
+        resources: {
+          requests: { cpu: "10m", memory: "16Mi" },
+          limits: { cpu: "100m", memory: "64Mi" },
+        },
+      }
+    : {
+        name: "write-prompt",
+        image: "busybox:1.36",
+        imagePullPolicy: "IfNotPresent",
+        command: ["sh", "-c", "printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
+        env: [{ name: "PROMPT_CONTENT", value: prompt }],
+        volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
+        securityContext,
+        resources: {
+          requests: { cpu: "10m", memory: "16Mi" },
+          limits: { cpu: "100m", memory: "64Mi" },
+        },
+      };
+
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
     kind: "Job",
@@ -362,23 +485,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           securityContext: podSecurityContext,
           ...(selfPod.imagePullSecrets.length > 0 ? { imagePullSecrets: selfPod.imagePullSecrets } : {}),
           ...(selfPod.dnsConfig ? { dnsConfig: selfPod.dnsConfig } : {}),
-          ...(Object.keys(nodeSelector).length > 0 ? { nodeSelector: nodeSelector as Record<string, string> } : {}),
+          ...(Object.keys(nodeSelector).length > 0 ? { nodeSelector } : {}),
           ...(tolerations.length > 0 ? { tolerations: tolerations as k8s.V1Toleration[] } : {}),
-          initContainers: [
-            {
-              name: "write-prompt",
-              image: "busybox:1.36",
-              imagePullPolicy: "IfNotPresent",
-              command: ["sh", "-c", "printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
-              env: [{ name: "PROMPT_CONTENT", value: prompt }],
-              volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
-              securityContext,
-              resources: {
-                requests: { cpu: "10m", memory: "16Mi" },
-                limits: { cpu: "100m", memory: "64Mi" },
-              },
-            },
-          ],
+          initContainers: [initContainer],
           containers: [
             {
               name: "claude",
@@ -399,5 +508,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret };
 }

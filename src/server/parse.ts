@@ -9,6 +9,9 @@ export function parseClaudeStreamJson(stdout: string) {
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  // Belt-and-braces dedup: track seen text blocks to filter duplicates
+  // caused by log stream reconnects replaying overlapping windows.
+  const seenTexts = new Set<string>();
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -32,7 +35,10 @@ export function parseClaudeStreamJson(stdout: string) {
         const block = entry as Record<string, unknown>;
         if (asString(block.type, "") === "text") {
           const text = asString(block.text, "");
-          if (text) assistantTexts.push(text);
+          if (text && !seenTexts.has(text)) {
+            seenTexts.add(text);
+            assistantTexts.push(text);
+          }
         }
       }
       continue;
