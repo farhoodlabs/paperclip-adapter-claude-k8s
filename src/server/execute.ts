@@ -8,6 +8,7 @@ import {
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi } from "./k8s-client.js";
 import { buildJobManifest } from "./job-manifest.js";
+import { LogLineDedupFilter } from "./log-dedup.js";
 import type * as k8s from "@kubernetes/client-node";
 import { Writable } from "node:stream";
 
@@ -190,6 +191,7 @@ async function streamPodLogsOnce(
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
   sinceSeconds?: number,
+  dedup?: LogLineDedupFilter,
 ): Promise<string> {
   const logApi = getLogApi(kubeconfigPath);
   const chunks: string[] = [];
@@ -198,7 +200,12 @@ async function streamPodLogsOnce(
     write(chunk: Buffer, _encoding, callback) {
       const text = chunk.toString("utf-8");
       chunks.push(text);
-      void onLog("stdout", text).then(() => callback(), callback);
+      const emitted = dedup ? dedup.filter(text) : text;
+      if (!emitted) {
+        callback();
+        return;
+      }
+      void onLog("stdout", emitted).then(() => callback(), callback);
     },
   });
 
@@ -238,6 +245,9 @@ async function streamPodLogs(
   // reconnects use a tight window instead of an ever-growing one anchored
   // at stream start.  This is the primary fix for FAR-105 duplicative logs.
   let lastLogReceivedAt = Math.floor(Date.now() / 1000);
+  // Shared across reconnects so replayed lines inside the `sinceSeconds`
+  // overlap window are dropped before they reach the streaming UI (FAR-123).
+  const dedup = new LogLineDedupFilter();
 
   while (!stopSignal?.stopped) {
     if (attempt >= MAX_LOG_RECONNECT_ATTEMPTS) {
@@ -257,7 +267,7 @@ async function streamPodLogs(
     }
 
     const preStreamTs = Math.floor(Date.now() / 1000);
-    const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds);
+    const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds, dedup);
     if (result) {
       allChunks.push(result);
       // Update last-received timestamp to now (the stream just ended,
@@ -276,6 +286,11 @@ async function streamPodLogs(
     // Brief pause before reconnecting to avoid tight loops.
     await new Promise((resolve) => setTimeout(resolve, LOG_STREAM_RECONNECT_DELAY_MS));
   }
+
+  // Flush any buffered partial line so the final assistant/result chunk
+  // isn't dropped when the stream ends mid-line.
+  const tail = dedup.flush();
+  if (tail) await onLog("stdout", tail);
 
   return allChunks.join("");
 }
