@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { buildJobManifest } from "./job-manifest.js";
+import { buildJobManifest, buildRtkSetupCommands } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -639,6 +639,93 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const init = job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.env?.[0]?.name).toBe("PROMPT_CONTENT");
+    });
+  });
+
+  describe("rtk output filtering", () => {
+    it("does not modify main command when enableRtk is false (default)", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command;
+      // Command should be the plain `cat ... | claude ...` form with no rtk setup
+      expect(cmd?.[2]).toMatch(/^cat \/tmp\/prompt\/prompt\.txt \| claude /);
+      expect(cmd?.[2]).not.toContain("rtk-filter");
+    });
+
+    it("prepends RTK setup commands when enableRtk is true", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command;
+      expect(cmd?.[2]).toContain(".rtk-filter.js");
+      expect(cmd?.[2]).toContain("cat /tmp/prompt/prompt.txt | claude");
+    });
+
+    it("RTK setup runs before claude invocation", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      const rtkIdx = cmd.indexOf(".rtk-filter.js");
+      const claudeIdx = cmd.indexOf("cat /tmp/prompt/prompt.txt | claude");
+      expect(rtkIdx).toBeGreaterThanOrEqual(0);
+      expect(claudeIdx).toBeGreaterThan(rtkIdx);
+    });
+
+    it("RTK setup uses node (no external binaries)", () => {
+      ctx.config = { enableRtk: true };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      // Should only use `node` — no curl, wget, apt, pip, etc.
+      expect(cmd).not.toMatch(/\b(curl|wget|apt|yum|pip|gem|cargo|go\s+get)\b/);
+      expect(cmd).toContain("node ");
+    });
+
+    it("uses default 50000 byte threshold when rtkMaxOutputBytes not set", () => {
+      ctx.config = { enableRtk: true };
+      const setup = buildRtkSetupCommands(50000);
+      // The filter script base64 should decode to contain the MAX constant
+      const b64Match = setup.match(/Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)/);
+      expect(b64Match).not.toBeNull();
+      const decoded = Buffer.from(b64Match![1], "base64").toString("utf-8");
+      expect(decoded).toContain("50000");
+    });
+
+    it("respects custom rtkMaxOutputBytes", () => {
+      ctx.config = { enableRtk: true, rtkMaxOutputBytes: 100000 };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      // The custom threshold should appear in the base64-encoded filter script
+      const b64Matches = [...cmd.matchAll(/Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)/g)];
+      const decoded = b64Matches.map((m) => Buffer.from(m[1], "base64").toString("utf-8")).join("\n");
+      expect(decoded).toContain("100000");
+    });
+
+    it("RTK setup installs a PostToolUse hook in claude settings", () => {
+      const setup = buildRtkSetupCommands(50000);
+      // The settings script (second base64 block) should reference PostToolUse
+      const b64Matches = [...setup.matchAll(/Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)/g)];
+      expect(b64Matches.length).toBeGreaterThanOrEqual(2);
+      const settingsScript = Buffer.from(b64Matches[1]![1], "base64").toString("utf-8");
+      expect(settingsScript).toContain("PostToolUse");
+      expect(settingsScript).toContain("settings.json");
+    });
+
+    it("filter script handles string content truncation", () => {
+      // Decode the filter script and verify it truncates string content
+      const setup = buildRtkSetupCommands(1000);
+      const b64Matches = [...setup.matchAll(/Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)/g)];
+      const filterScript = Buffer.from(b64Matches[0]![1], "base64").toString("utf-8");
+      expect(filterScript).toContain("MAX=1000");
+      expect(filterScript).toContain("truncated by paperclip-rtk");
+      expect(filterScript).toContain("tool_response");
+      expect(filterScript).toContain("tool_result");
+    });
+
+    it("filter script handles array content (block format)", () => {
+      const setup = buildRtkSetupCommands(50000);
+      const b64Matches = [...setup.matchAll(/Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)/g)];
+      const filterScript = Buffer.from(b64Matches[0]![1], "base64").toString("utf-8");
+      // Should handle array content blocks (text field on each block)
+      expect(filterScript).toContain("Array.isArray");
+      expect(filterScript).toContain("b.text");
     });
   });
 });

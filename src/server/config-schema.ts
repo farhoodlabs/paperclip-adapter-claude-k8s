@@ -133,6 +133,21 @@ export function getConfigSchema(): AdapterConfigSchema {
       label: "Labels",
       hint: "Extra labels added to Job metadata. One key=value per line.",
     },
+    // Output filtering (RTK-compatible)
+    {
+      type: "toggle",
+      key: "enableRtk",
+      label: "Enable Output Filtering",
+      hint: "Truncate oversized tool outputs before they reach the model, reducing token consumption. Implemented natively in Node.js — no external binary required. Installs a PostToolUse hook in ~/.claude/settings.json for each run.",
+      default: false,
+    },
+    {
+      type: "number",
+      key: "rtkMaxOutputBytes",
+      label: "Max Tool Output Bytes",
+      hint: "Maximum bytes of tool output to pass to the model when output filtering is enabled. Outputs exceeding this threshold are truncated with a summary. Default: 50000.",
+      default: 50000,
+    },
   ];
 
   return { fields };
