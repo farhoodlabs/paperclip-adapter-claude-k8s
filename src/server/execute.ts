@@ -883,6 +883,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           if (terminal) {
             keepaliveJobTerminal = true;
             keepaliveJobTerminalAt = Date.now();
+            if (ctx.onSpawn) {
+              void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
+            }
             return;
           }
         } catch (err: unknown) {
@@ -893,6 +896,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           if (isK8s404(err)) {
             keepaliveJobTerminal = true;
             keepaliveJobTerminalAt = Date.now();
+            if (ctx.onSpawn) {
+              void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
+            }
             return;
           }
           // Log transient errors but leave keepaliveJobTerminal false so
