@@ -89,30 +89,46 @@ export function buildPartialRunError(
     : `Claude exited with code ${exitCode ?? -1}`;
 }
 
+export type OrphanClassification =
+  | "reattach"
+  | "block_session_mismatch"
+  | "block_task_mismatch"
+  | "block_task_unknown";
+
 /**
- * Evaluate an orphaned K8s Job (one whose `paperclip.io/run-id` label does
- * not match the current runId) as a potential reattach target.  A Job is
- * reattachable when it belongs to the same agent, same task, and same resume
- * session as the current run — meaning the previous Paperclip instance was
- * mid-stream on the exact piece of work this new run was dispatched to do.
+ * Classify a non-terminal orphaned K8s Job (one whose `paperclip.io/run-id`
+ * label does not match the current runId but does belong to this agent) as a
+ * reattach candidate or a block reason.
+ *
+ * Decision matrix:
+ *   - taskId mismatch (both present, different values)         → block_task_mismatch
+ *   - taskId missing on either side                            → block_task_unknown
+ *   - taskId match + both have sessionId + sessionIds differ   → block_session_mismatch
+ *   - taskId match + one or both sides missing sessionId       → reattach (reconcile)
+ *   - taskId match + both have sessionId + sessionIds match    → reattach (happy path)
+ *
  * Exported for unit tests.
  */
-export function isReattachableOrphan(
+export function classifyOrphan(
   job: k8s.V1Job,
-  expected: { agentId: string; taskId: string | null; sessionId: string | null },
-): boolean {
-  if (!expected.taskId || !expected.sessionId) return false;
+  expected: { taskId: string | null; sessionId: string | null },
+): OrphanClassification {
   const labels = job.metadata?.labels ?? {};
-  if (labels["paperclip.io/adapter-type"] !== "claude_k8s") return false;
-  if (labels["paperclip.io/agent-id"] !== expected.agentId) return false;
-  if (labels["paperclip.io/task-id"] !== expected.taskId) return false;
-  if (labels["paperclip.io/session-id"] !== expected.sessionId) return false;
-  const conditions = job.status?.conditions ?? [];
-  const terminal = conditions.some(
-    (c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True",
-  );
-  if (terminal) return false;
-  return true;
+  const jobTaskId = labels["paperclip.io/task-id"] ?? null;
+  const jobSessionId = labels["paperclip.io/session-id"] ?? null;
+
+  // taskId missing on either side
+  if (!expected.taskId || !jobTaskId) return "block_task_unknown";
+
+  // taskId mismatch
+  if (expected.taskId !== jobTaskId) return "block_task_mismatch";
+
+  // taskId matches — check sessionId
+  if (expected.sessionId && jobSessionId && expected.sessionId !== jobSessionId) {
+    return "block_session_mismatch";
+  }
+
+  return "reattach";
 }
 
 /**
@@ -553,18 +569,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") === runId,
       );
 
-      // Pick the most recent reattachable orphan — same agent + task + session,
-      // not terminal.  Only one target is chosen; any other orphans get
-      // cleaned up as before.
+      // Pick the most recent reattachable orphan — same task + session, not
+      // terminal.  Only one target is chosen; any other orphans get cleaned up.
       if (reattachOrphanedJobs && orphaned.length > 0) {
         const candidates = orphaned
-          .filter((j) =>
-            isReattachableOrphan(j, {
-              agentId,
-              taskId: currentTaskLabel,
-              sessionId: currentSessionLabel,
-            }),
-          )
+          .filter((j) => classifyOrphan(j, { taskId: currentTaskLabel, sessionId: currentSessionLabel }) === "reattach")
           .sort((a, b) => {
             const at = new Date(a.metadata?.creationTimestamp ?? 0).getTime();
             const bt = new Date(b.metadata?.creationTimestamp ?? 0).getTime();

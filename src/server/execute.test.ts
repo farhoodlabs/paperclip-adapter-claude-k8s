@@ -15,7 +15,7 @@ vi.mock("./k8s-client.js", () => ({
   resetCache: vi.fn(),
 }));
 
-const { isK8s404, buildPartialRunError, isReattachableOrphan, describePodTerminatedError, streamPodLogsOnce } = await import("./execute.js");
+const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, streamPodLogsOnce } = await import("./execute.js");
 
 function makeJob(opts: {
   runId?: string;
@@ -146,59 +146,59 @@ describe("buildPartialRunError", () => {
   });
 });
 
-describe("isReattachableOrphan", () => {
-  const agentId = "agent-abc";
+describe("classifyOrphan", () => {
   const taskId = "task-xyz";
   const sessionId = "sess-123";
 
-  it("returns true when agent/task/session all match and Job is not terminal", () => {
-    const job = makeJob({ agentId, taskId, sessionId, runId: "old-run" });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(true);
+  // --- Happy path: reattach ---
+  it("returns reattach when taskId matches and both sessionIds match", () => {
+    const job = makeJob({ taskId, sessionId });
+    expect(classifyOrphan(job, { taskId, sessionId })).toBe("reattach");
   });
 
-  it("returns false when the Job is already Complete", () => {
-    const job = makeJob({ agentId, taskId, sessionId, runId: "old-run", terminal: true });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
+  it("returns reattach when taskId matches and expected sessionId is null (missing on current side)", () => {
+    const job = makeJob({ taskId, sessionId });
+    expect(classifyOrphan(job, { taskId, sessionId: null })).toBe("reattach");
   });
 
-  it("returns false when expected taskId is null (caller couldn't derive one)", () => {
-    const job = makeJob({ agentId, taskId, sessionId });
-    expect(isReattachableOrphan(job, { agentId, taskId: null, sessionId })).toBe(false);
+  it("returns reattach when taskId matches and job has no session-id label (missing on job side)", () => {
+    const job = makeJob({ taskId });
+    expect(classifyOrphan(job, { taskId, sessionId })).toBe("reattach");
   });
 
-  it("returns false when expected sessionId is null", () => {
-    const job = makeJob({ agentId, taskId, sessionId });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId: null })).toBe(false);
+  it("returns reattach when taskId matches and neither side has a sessionId", () => {
+    const job = makeJob({ taskId });
+    expect(classifyOrphan(job, { taskId, sessionId: null })).toBe("reattach");
   });
 
-  it("returns false when agent id doesn't match", () => {
-    const job = makeJob({ agentId: "agent-other", taskId, sessionId });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
+  // --- Block: task unknown ---
+  it("returns block_task_unknown when expected taskId is null", () => {
+    const job = makeJob({ taskId, sessionId });
+    expect(classifyOrphan(job, { taskId: null, sessionId })).toBe("block_task_unknown");
   });
 
-  it("returns false when task id doesn't match", () => {
-    const job = makeJob({ agentId, taskId: "task-other", sessionId });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
+  it("returns block_task_unknown when job has no task-id label", () => {
+    const job = makeJob({ sessionId });
+    expect(classifyOrphan(job, { taskId, sessionId })).toBe("block_task_unknown");
   });
 
-  it("returns false when session id doesn't match", () => {
-    const job = makeJob({ agentId, taskId, sessionId: "sess-other" });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
+  // --- Block: task mismatch ---
+  it("returns block_task_mismatch when both sides have taskId but they differ", () => {
+    const job = makeJob({ taskId: "task-other", sessionId });
+    expect(classifyOrphan(job, { taskId, sessionId })).toBe("block_task_mismatch");
   });
 
-  it("returns false when the Job is from a different adapter type", () => {
-    const job = makeJob({ agentId, taskId, sessionId, adapterType: "claude_local" });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
+  // --- Block: session mismatch ---
+  it("returns block_session_mismatch when taskId matches but sessionIds differ", () => {
+    const job = makeJob({ taskId, sessionId: "sess-other" });
+    expect(classifyOrphan(job, { taskId, sessionId })).toBe("block_session_mismatch");
   });
 
-  it("returns false when Job has no task-id label (labels were introduced in FAR-124)", () => {
-    const job = makeJob({ agentId, sessionId });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
-  });
-
-  it("returns false when Job has no session-id label", () => {
-    const job = makeJob({ agentId, taskId });
-    expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
+  // --- Terminal orphan (caller filters these before classifyOrphan) ---
+  it("returns reattach for terminal job (caller is responsible for filtering terminals)", () => {
+    const job = makeJob({ taskId, sessionId, terminal: true });
+    // classifyOrphan does not check terminal status — that is the caller's job
+    expect(classifyOrphan(job, { taskId, sessionId })).toBe("reattach");
   });
 });
 
