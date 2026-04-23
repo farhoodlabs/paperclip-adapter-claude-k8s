@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
-import { isK8s404, buildPartialRunError, isReattachableOrphan } from "./execute.js";
+import { isK8s404, buildPartialRunError, isReattachableOrphan, describePodTerminatedError } from "./execute.js";
 
 function makeJob(opts: {
   runId?: string;
@@ -184,5 +184,64 @@ describe("isReattachableOrphan", () => {
   it("returns false when Job has no session-id label", () => {
     const job = makeJob({ agentId, taskId });
     expect(isReattachableOrphan(job, { agentId, taskId, sessionId })).toBe(false);
+  });
+});
+
+// Regression: FAR-10 — waitForPod must throw on phase=Failed, not return the pod name.
+// These tests cover describePodTerminatedError, the helper that waitForPod uses to build
+// the error message before throwing.  Verifies that phase=Failed with no claude logs
+// produces a structured, actionable error instead of silently entering the log-stream path.
+describe("describePodTerminatedError", () => {
+  it("includes exit code and reason when claude container status is available", () => {
+    const cs = [
+      {
+        name: "claude",
+        state: { terminated: { exitCode: 137, reason: "OOMKilled" } },
+      },
+    ] as k8s.V1ContainerStatus[];
+    const msg = describePodTerminatedError("mypod", "Failed", cs);
+    expect(msg).toContain("137");
+    expect(msg).toContain("OOMKilled");
+    expect(msg).toContain("phase=Failed");
+  });
+
+  it("falls back to message field when reason is absent", () => {
+    const cs = [
+      {
+        name: "claude",
+        state: { terminated: { exitCode: 1, message: "signal: killed" } },
+      },
+    ] as k8s.V1ContainerStatus[];
+    const msg = describePodTerminatedError("mypod", "Failed", cs);
+    expect(msg).toContain("signal: killed");
+    expect(msg).toContain("1");
+  });
+
+  it("returns generic message when no claude container status is present", () => {
+    const msg = describePodTerminatedError("mypod", "Failed", []);
+    expect(msg).toBe("Pod mypod reached phase=Failed");
+  });
+
+  it("ignores non-claude containers", () => {
+    const cs = [
+      {
+        name: "sidecar",
+        state: { terminated: { exitCode: 0, reason: "Completed" } },
+      },
+    ] as k8s.V1ContainerStatus[];
+    const msg = describePodTerminatedError("mypod", "Failed", cs);
+    expect(msg).toBe("Pod mypod reached phase=Failed");
+  });
+
+  it("handles null exitCode gracefully", () => {
+    const cs = [
+      {
+        name: "claude",
+        state: { terminated: { exitCode: null, reason: "Error" } },
+      },
+    ] as unknown as k8s.V1ContainerStatus[];
+    const msg = describePodTerminatedError("mypod", "Failed", cs);
+    expect(msg).toContain("unknown");
+    expect(msg).toContain("Error");
   });
 });
