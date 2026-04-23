@@ -345,7 +345,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const extraArgs = asStringArray(config.extraArgs);
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
-  const resources = parseObject(config.resources);
   const nodeSelector = parseKeyValueConfig(config.nodeSelector);
   const tolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
   const extraLabels = parseKeyValueConfig(config.labels);
@@ -427,17 +426,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Build env vars
   const envVars = buildEnvVars(ctx, selfPod, config);
 
-  // Resource defaults
-  const resourceRequests = parseObject(resources.requests);
-  const resourceLimits = parseObject(resources.limits);
+  // Resource defaults — UI stores dotted keys (e.g. "resources.requests.cpu")
+  // as flat config entries, so read them directly from config with the dotted key.
   const containerResources: k8s.V1ResourceRequirements = {
     requests: {
-      cpu: asString(resourceRequests.cpu, "1000m"),
-      memory: asString(resourceRequests.memory, "2Gi"),
+      cpu: asString(config["resources.requests.cpu"], "1000m"),
+      memory: asString(config["resources.requests.memory"], "2Gi"),
     },
     limits: {
-      cpu: asString(resourceLimits.cpu, "4000m"),
-      memory: asString(resourceLimits.memory, "8Gi"),
+      cpu: asString(config["resources.limits.cpu"], "4000m"),
+      memory: asString(config["resources.limits.memory"], "8Gi"),
     },
   };
 

@@ -176,7 +176,7 @@ async function waitForPod(
     const containerStatuses = pod.status?.containerStatuses ?? [];
 
     // Log phase transitions
-    const statusKey = `${phase}:${initStatuses.map((s) => s.state?.waiting?.reason ?? s.state?.terminated?.reason ?? "ok").join(",")}:${containerStatuses.map((s) => s.state?.waiting?.reason ?? s.state?.running ? "running" : "waiting").join(",")}`;
+    const statusKey = `${phase}:${initStatuses.map((s) => s.state?.waiting?.reason ?? s.state?.terminated?.reason ?? "ok").join(",")}:${containerStatuses.map((s) => s.state?.waiting?.reason ?? (s.state?.running ? "running" : "waiting")).join(",")}`;
     if (statusKey !== lastStatus) {
       const details: string[] = [`phase=${phase}`];
       for (const init of initStatuses) {
@@ -301,7 +301,10 @@ export async function streamPodLogsOnce(
       if (stopSignal.stopped) {
         if (!writable.destroyed) writable.destroy();
         if (!bailTimer && bailResolve) {
-          bailTimer = setTimeout(bailResolve, LOG_STREAM_BAIL_TIMEOUT_MS);
+          bailTimer = setTimeout(() => {
+            onLog("stderr", "[paperclip] Log stream bail timer fired — forcing return\n").catch(() => {});
+            bailResolve!();
+          }, LOG_STREAM_BAIL_TIMEOUT_MS);
         }
       }
     }, 200);
@@ -958,7 +961,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // from the beginning of the log, giving us the full output.
     // We use a cheap string scan for the result-event guard (avoids a full JSON parse here;
     // the authoritative parse happens once below after all fallbacks complete).
-    const hasResultEvent = stdout.includes('"type":"result"');
+    const hasResultEvent = stdout.split("\n").some((l) => { try { return JSON.parse(l).type === "result"; } catch { return false; } });
     const needsOneShot = !stdout.trim() || (stdout.trim() && !hasResultEvent);
     if (needsOneShot) {
       if (!stdout.trim()) {

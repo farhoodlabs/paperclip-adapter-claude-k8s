@@ -85,8 +85,13 @@ async function checkRbac(
     { resource: "jobs", group: "batch", verb: "create", code: "k8s_rbac_job_create", label: "create Jobs" },
     { resource: "jobs", group: "batch", verb: "delete", code: "k8s_rbac_job_delete", label: "delete Jobs" },
     { resource: "jobs", group: "batch", verb: "get", code: "k8s_rbac_job_get", label: "get Jobs" },
+    { resource: "jobs", group: "batch", verb: "list", code: "k8s_rbac_job_list", label: "list Jobs" },
     { resource: "pods", group: "", verb: "list", code: "k8s_rbac_pod_list", label: "list Pods" },
     { resource: "pods/log", group: "", verb: "get", code: "k8s_rbac_pod_log", label: "get Pod logs" },
+    { resource: "secrets", group: "", verb: "create", code: "k8s_rbac_secret_create", label: "create Secrets" },
+    { resource: "secrets", group: "", verb: "delete", code: "k8s_rbac_secret_delete", label: "delete Secrets" },
+    { resource: "secrets", group: "", verb: "get", code: "k8s_rbac_secret_get", label: "get Secrets" },
+    { resource: "persistentvolumeclaims", group: "", verb: "get", code: "k8s_rbac_pvc_get", label: "get PersistentVolumeClaims" },
   ];
 
   for (const check of rbacChecks) {
@@ -221,16 +226,18 @@ export async function testEnvironment(
 
   // 2. Target namespace exists
   const nsOk = await checkNamespace(namespace, selfPod.namespace, checks, kubeconfigPath);
-  if (!nsOk) {
-    return { adapterType: ctx.adapterType, status: summarizeStatus(checks), checks, testedAt: new Date().toISOString() };
-  }
 
-  // 3-5. Run remaining checks in parallel
-  await Promise.all([
-    checkRbac(namespace, checks, kubeconfigPath),
-    checkSecret(namespace, secretRef, checks, kubeconfigPath),
-    checkPvc(selfPod, checks, kubeconfigPath),
-  ]);
+  // 3-5. Run remaining checks even if namespace check failed so operators see
+  // all issues at once instead of fixing them one at a time.
+  if (nsOk) {
+    await Promise.all([
+      checkRbac(namespace, checks, kubeconfigPath),
+      checkSecret(namespace, secretRef, checks, kubeconfigPath),
+      checkPvc(selfPod, checks, kubeconfigPath),
+    ]);
+  } else {
+    await checkRbac(namespace, checks, kubeconfigPath);
+  }
 
   return {
     adapterType: ctx.adapterType,

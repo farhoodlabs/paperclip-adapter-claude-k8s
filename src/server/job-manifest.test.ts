@@ -438,10 +438,10 @@ describe("buildJobManifest", () => {
 
     it("uses configured resource overrides", () => {
       ctx.config = {
-        resources: {
-          requests: { cpu: "500m", memory: "1Gi" },
-          limits: { cpu: "2000m", memory: "4Gi" },
-        },
+        "resources.requests.cpu": "500m",
+        "resources.requests.memory": "1Gi",
+        "resources.limits.cpu": "2000m",
+        "resources.limits.memory": "4Gi",
       };
       const { job } = buildJobManifest({ ctx, selfPod });
       const resources = job.spec?.template?.spec?.containers[0]?.resources;
