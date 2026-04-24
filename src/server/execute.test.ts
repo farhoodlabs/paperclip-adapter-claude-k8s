@@ -60,7 +60,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   });
 });
 
-const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, streamPodLogsOnce, execute } = await import("./execute.js");
+const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, streamPodLogsOnce, shouldAbortForCancellation, execute } = await import("./execute.js");
 
 function makeJob(opts: {
   runId?: string;
@@ -1218,5 +1218,264 @@ describe("execute: concurrency guard — multiple orphans", () => {
     // Newest orphan (task-other) is classified first → block_task_mismatch
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
     expect(result.errorMessage).toContain("different task");
+  });
+});
+
+// ─── shouldAbortForCancellation ──────────────────────────────────────────────
+
+describe("shouldAbortForCancellation", () => {
+  it("returns false for undefined", () => {
+    expect(shouldAbortForCancellation(undefined)).toBe(false);
+  });
+
+  it("returns false for empty string", () => {
+    expect(shouldAbortForCancellation("")).toBe(false);
+  });
+
+  it("returns false when status is 'running'", () => {
+    expect(shouldAbortForCancellation("running")).toBe(false);
+  });
+
+  it("returns true when status is 'cancelled'", () => {
+    expect(shouldAbortForCancellation("cancelled")).toBe(true);
+  });
+
+  it("returns true when status is 'failed'", () => {
+    expect(shouldAbortForCancellation("failed")).toBe(true);
+  });
+
+  it("returns true when status is 'completed'", () => {
+    expect(shouldAbortForCancellation("completed")).toBe(true);
+  });
+
+  it("returns true for any non-running non-empty string", () => {
+    expect(shouldAbortForCancellation("unknown")).toBe(true);
+  });
+});
+
+// ─── execute: cancel-polling path ────────────────────────────────────────────
+
+describe("execute: cancel-polling via keepalive tick", () => {
+  const mockFetch = vi.fn();
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    // Replace global fetch for this suite
+    vi.stubGlobal("fetch", mockFetch);
+    process.env.PAPERCLIP_API_URL = "http://paperclip-test.local";
+
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
+    mockBatchPatchJob.mockResolvedValue({});
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
+
+    mockCoreListPods
+      .mockResolvedValueOnce({
+        items: [{
+          metadata: { name: "pod-abc" },
+          status: { phase: "Running", containerStatuses: [], initContainerStatuses: [] },
+        }],
+      })
+      .mockResolvedValue({
+        items: [{
+          metadata: { name: "pod-abc" },
+          status: { containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 0 } } }] },
+        }],
+      });
+
+    // Job never reaches terminal on its own (cancel kicks in first)
+    mockBatchReadJob.mockResolvedValue({ status: { conditions: [] } });
+
+    // Log stream never ends (hung — simulates long-running Claude)
+    mockLogFn.mockImplementation(() => new Promise(() => { /* never resolves */ }));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    delete process.env.PAPERCLIP_API_URL;
+  });
+
+  it("returns errorCode=cancelled when poll detects non-running status within one keepalive tick", async () => {
+    // Use a flag so readJob throws 404 only AFTER deleteJob is called (simulating
+    // K8s state where the job disappears after deletion).
+    let jobDeleted = false;
+    mockBatchDeleteJob.mockImplementation(async () => { jobDeleted = true; return {}; });
+    mockBatchReadJob.mockImplementation(async () => {
+      if (jobDeleted) {
+        throw Object.assign(new Error("Not Found"), { response: { statusCode: 404 } });
+      }
+      return { status: { conditions: [] } };
+    });
+
+    // Cancel poll returns "cancelled" status.
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: "cancelled" }),
+    });
+
+    const executePromise = execute(
+      makeCtx({ authToken: "tok-abc" } as Partial<AdapterExecutionContext>),
+    );
+
+    // Timer sequence:
+    //   t=15100: keepalive fires → pre-check non-terminal → fetch → cancelled →
+    //            deleteJob (jobDeleted=true) → stop signal set
+    //   t=15300: stop poller fires (200ms) → destroys writable → starts 3s bail timer
+    //   t=17100: completion watcher polls → 404 (jobDeleted=true) → jobGone → settles
+    //   t=18300: bail timer fires → streamPodLogsOnce returns → streamPodLogs exits →
+    //            trackedLogStream settles → Promise.allSettled resolves
+    await vi.advanceTimersByTimeAsync(15_100); // keepalive fires → cancel detected
+    await vi.advanceTimersByTimeAsync(2_100);  // completion watcher polls → 404 → settles
+    await vi.advanceTimersByTimeAsync(3_100);  // bail timer fires → log stream settles
+
+    const result = await executePromise;
+
+    expect(result.errorCode).toBe("cancelled");
+    expect(result.errorMessage).toBe("Run cancelled");
+    expect(result.timedOut).toBe(false);
+    expect(mockBatchDeleteJob).toHaveBeenCalled();
+  });
+
+  it("treats HTTP 500 on cancel poll as transient and does not cancel", async () => {
+    // Cancel poll returns 500 → transient, should not cancel.
+    // After a while the job completes normally.
+    mockFetch.mockResolvedValue({ ok: false, status: 500 });
+
+    // Override: job completes after keepalive tick fires
+    mockBatchReadJob
+      .mockResolvedValueOnce({ status: { conditions: [] } }) // first keepalive check: non-terminal
+      .mockResolvedValue({ status: { conditions: [{ type: "Complete", status: "True" }] } });
+    mockLogFn.mockImplementation(
+      async (_ns: string, _pod: string, _ctr: string, writable: import("node:stream").Writable) => {
+        writable.write(CLAUDE_HAPPY_OUTPUT);
+      },
+    );
+
+    const executePromise = execute(
+      makeCtx({ authToken: "tok-abc" } as Partial<AdapterExecutionContext>),
+    );
+
+    await vi.advanceTimersByTimeAsync(15_100); // keepalive fires: 500 → transient, no cancel
+    await vi.advanceTimersByTimeAsync(3_100);  // log reconnect sleep → stopSignal already true
+
+    const result = await executePromise;
+
+    expect(result.errorCode).toBeUndefined();
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("sess_test123");
+  });
+
+  it("skips cancel poll when authToken is absent", async () => {
+    // No authToken → cancel poll must not be attempted → job completes normally
+    mockBatchReadJob.mockResolvedValue({
+      status: { conditions: [{ type: "Complete", status: "True" }] },
+    });
+    mockLogFn.mockImplementation(
+      async (_ns: string, _pod: string, _ctr: string, writable: import("node:stream").Writable) => {
+        writable.write(CLAUDE_HAPPY_OUTPUT);
+      },
+    );
+
+    const executePromise = execute(makeCtx()); // no authToken
+
+    await vi.advanceTimersByTimeAsync(3_100);
+    const result = await executePromise;
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("skips cancel poll when PAPERCLIP_API_URL is not set", async () => {
+    delete process.env.PAPERCLIP_API_URL;
+
+    mockBatchReadJob.mockResolvedValue({
+      status: { conditions: [{ type: "Complete", status: "True" }] },
+    });
+    mockLogFn.mockImplementation(
+      async (_ns: string, _pod: string, _ctr: string, writable: import("node:stream").Writable) => {
+        writable.write(CLAUDE_HAPPY_OUTPUT);
+      },
+    );
+
+    const executePromise = execute(
+      makeCtx({ authToken: "tok-abc" } as Partial<AdapterExecutionContext>),
+    );
+
+    await vi.advanceTimersByTimeAsync(3_100);
+    const result = await executePromise;
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+// ─── execute: SIGTERM handler ─────────────────────────────────────────────────
+
+describe("execute: SIGTERM handler best-effort cleanup", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
+    mockBatchPatchJob.mockResolvedValue({});
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
+    mockCoreListPods
+      .mockResolvedValueOnce({
+        items: [{
+          metadata: { name: "pod-abc" },
+          status: { phase: "Running", containerStatuses: [], initContainerStatuses: [] },
+        }],
+      })
+      .mockResolvedValue({
+        items: [{
+          metadata: { name: "pod-abc" },
+          status: { containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 0 } } }] },
+        }],
+      });
+    mockBatchReadJob.mockResolvedValue({ status: { conditions: [] } });
+    mockLogFn.mockImplementation(() => new Promise(() => { /* never resolves */ }));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("deletes the active Job when SIGTERM fires during execution", async () => {
+    // Mock process.kill to prevent the test process from actually being killed.
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    // Start execute() and suppress unhandled rejection (we won't await it).
+    const executePromise = execute(makeCtx());
+    executePromise.catch(() => {});
+
+    // Flush microtasks through the async setup chain: getSelfPodInfo, listJobs,
+    // readSkillEntries, prepareBundle, createJob, onLog, activeJobs.add(), and
+    // ensureSigtermHandler() all complete before the try block enters streaming.
+    // 30 rounds is more than enough for the ~7 sequential await points.
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+
+    // Emit SIGTERM — the process.once handler fires synchronously and kicks off
+    // async cleanup (deleteNamespacedJob). The mock resolves immediately.
+    process.emit("SIGTERM");
+
+    // Flush microtasks for deleteJob to resolve and the .then(process.kill) to run.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    expect(mockBatchDeleteJob).toHaveBeenCalled();
+    expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGTERM");
+
+    killSpy.mockRestore();
+    // afterEach calls vi.useRealTimers() which clears all pending fake timers,
+    // so we do not need to settle executePromise.
   });
 });
