@@ -117,22 +117,30 @@ export function buildPartialRunError(
 ): string {
   if (exitCode === 0) return "Failed to parse Claude JSON output";
 
-  // Walk stdout lines, skip system events, return the first real content line.
+  // Walk stdout lines, skip system and intermediate streaming events, return
+  // the first human-readable content line.  assistant/user events are
+  // intermediate and contain raw JSON blobs that make poor error messages;
+  // result events are retained because they may carry useful error details
+  // (e.g. rate-limit messages).
   const firstContentLine = stdout.split(/\r?\n/)
     .map((l) => l.trim())
     .find((l) => {
       if (!l) return false;
       try {
         const obj = JSON.parse(l);
-        if (typeof obj === "object" && obj !== null && (obj as Record<string, unknown>).type === "system") return false;
+        if (typeof obj === "object" && obj !== null) {
+          const t = (obj as Record<string, unknown>).type;
+          if (t === "system" || t === "assistant" || t === "user") return false;
+        }
       } catch {
         // not JSON — treat as content
       }
       return true;
     }) ?? "";
 
-  // If we only have system/init events and nothing else, surface the model
-  // name so the operator can diagnose missing credentials or unsupported model.
+  // If the stream contains only system/init and intermediate events with no
+  // plain-text or result output, surface the model name so the operator can
+  // diagnose missing credentials or unsupported model.
   const initOnlyOutput = stdout.trim() !== "" && model !== "" && !firstContentLine;
   if (initOnlyOutput) {
     const modelHint = model ? ` (model: ${model})` : "";

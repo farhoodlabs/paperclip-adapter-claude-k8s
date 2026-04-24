@@ -178,6 +178,39 @@ describe("buildPartialRunError", () => {
     expect(msg).toContain("code 2");
   });
 
+  it("skips assistant events and surfaces model hint (FAR-32: MiniMax-M2.7 output_tokens=0)", () => {
+    // Reproduces the exact failure: init event + assistant event with only a
+    // thinking block and output_tokens=0, no result event.  The assistant JSON
+    // blob must not be surfaced verbatim as the error message.
+    const assistantEvent = JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "063ad6038e4c889faa7c95168e007d73",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "Let me start…", signature: "abc123" }],
+        model: "MiniMax-M2.7",
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 11013, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    });
+    const stdout = [initLine, assistantEvent].join("\n");
+    const msg = buildPartialRunError(null, "MiniMax-M2.7", stdout);
+    expect(msg).toContain("MiniMax-M2.7");
+    expect(msg).toContain("did not produce a result");
+    expect(msg).not.toContain("063ad6038e4c889faa7c95168e007d73");
+    expect(msg).not.toContain("output_tokens");
+    expect(msg).not.toContain("thinking");
+  });
+
+  it("skips user events alongside system events", () => {
+    const userEvent = JSON.stringify({ type: "user", message: { role: "user", content: [] } });
+    const stdout = [initLine, userEvent, "Error: API quota exceeded"].join("\n");
+    const msg = buildPartialRunError(1, "claude-sonnet-4-6", stdout);
+    expect(msg).toBe("Claude exited with code 1: Error: API quota exceeded");
+  });
+
   it("null exitCode renders as -1 in message", () => {
     const msg = buildPartialRunError(null, "", "Some plain error text");
     expect(msg).toBe("Claude exited with code -1: Some plain error text");
