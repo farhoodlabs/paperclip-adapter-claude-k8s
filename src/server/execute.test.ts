@@ -958,6 +958,42 @@ describe("execute: happy path", () => {
     expect(result.exitCode).toBeNull();
   });
 
+  it("returns llm_api_error when assistant event has stop_reason:null and output_tokens:0 (FAR-30)", async () => {
+    // Reproduces the MiniMax degradation pattern: init event + assistant event with
+    // stop_reason:null and output_tokens:0, no result event, Claude exits -1.
+    const emptyResponseOutput = [
+      JSON.stringify({ type: "system", subtype: "init", model: "MiniMax-M2.7", session_id: "sess_mm" }),
+      JSON.stringify({
+        type: "assistant",
+        session_id: "sess_mm",
+        message: {
+          id: "msg_empty",
+          stop_reason: null,
+          usage: { input_tokens: 500, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+          content: [],
+        },
+      }),
+    ].join("\n") + "\n";
+
+    mockLogFn.mockImplementation(
+      async (_ns: string, _pod: string, _ctr: string, writable: Writable) => {
+        writable.write(emptyResponseOutput);
+      },
+    );
+    // getPodExitCode: exit code -1 (as reported in the issue)
+    mockCoreListPods.mockResolvedValue({
+      items: [{ metadata: { name: "pod-abc" }, status: { containerStatuses: [{ name: "claude", state: { terminated: { exitCode: -1 } } }] } }],
+    });
+
+    const executePromise = execute(makeCtx());
+    await vi.advanceTimersByTimeAsync(3_100);
+    const result = await executePromise;
+
+    expect(result.errorCode).toBe("llm_api_error");
+    expect(result.errorMessage).toContain("stop_reason: null");
+    expect(result.errorMessage).toContain("output_tokens: 0");
+  });
+
   it("reconnects log stream and logs status when job completion takes > 3s", async () => {
     // Make waitForJobCompletion take 4s so the 3s stream reconnect fires first.
     // timeoutSec=4, graceSec=0 → completionTimeoutMs=4000.

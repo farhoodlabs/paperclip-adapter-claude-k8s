@@ -154,6 +154,87 @@ more raw output`;
     // Should not be "Hello world\n\nHello world"
     expect(result.summary.split("Hello world").length).toBe(2);
   });
+
+  it("sets llmApiEmptyResponse=true when stop_reason:null and usage.output_tokens:0", () => {
+    const initLine = JSON.stringify({ type: "system", subtype: "init", model: "MiniMax-M2.7", session_id: "sess_1" });
+    const assistantEvent = JSON.stringify({
+      type: "assistant",
+      session_id: "sess_1",
+      message: {
+        id: "msg_abc",
+        stop_reason: null,
+        usage: { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        content: [],
+      },
+    });
+    const result = parseClaudeStreamJson([initLine, assistantEvent].join("\n"));
+    expect(result.llmApiEmptyResponse).toBe(true);
+    expect(result.resultJson).toBeNull();
+  });
+
+  it("sets llmApiEmptyResponse=true when stop_reason:null and message-level output_tokens:0", () => {
+    const assistantEvent = JSON.stringify({
+      type: "assistant",
+      message: { stop_reason: null, output_tokens: 0, content: [] },
+    });
+    const result = parseClaudeStreamJson(assistantEvent);
+    expect(result.llmApiEmptyResponse).toBe(true);
+  });
+
+  it("does not set llmApiEmptyResponse when stop_reason is non-null", () => {
+    const assistantEvent = JSON.stringify({
+      type: "assistant",
+      message: {
+        stop_reason: "end_turn",
+        usage: { output_tokens: 0 },
+        content: [],
+      },
+    });
+    const result = parseClaudeStreamJson(assistantEvent);
+    expect(result.llmApiEmptyResponse).toBe(false);
+  });
+
+  it("does not set llmApiEmptyResponse when output_tokens > 0", () => {
+    const assistantEvent = JSON.stringify({
+      type: "assistant",
+      message: {
+        stop_reason: null,
+        usage: { output_tokens: 5 },
+        content: [{ type: "text", text: "hello" }],
+      },
+    });
+    const result = parseClaudeStreamJson(assistantEvent);
+    expect(result.llmApiEmptyResponse).toBe(false);
+  });
+
+  it("clears llmApiEmptyResponse when a result event follows the empty assistant event", () => {
+    const assistantEvent = JSON.stringify({
+      type: "assistant",
+      message: { stop_reason: null, usage: { output_tokens: 0 }, content: [] },
+    });
+    const resultEvent = JSON.stringify({
+      type: "result",
+      result: "Done",
+      subtype: "stop",
+      total_cost_usd: 0.001,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 },
+    });
+    const result = parseClaudeStreamJson([assistantEvent, resultEvent].join("\n"));
+    expect(result.llmApiEmptyResponse).toBe(false);
+    expect(result.resultJson).not.toBeNull();
+  });
+
+  it("sets llmApiEmptyResponse=false for normal result", () => {
+    const resultEvent = JSON.stringify({
+      type: "result",
+      result: "Done",
+      subtype: "stop",
+      total_cost_usd: 0.005,
+      usage: { input_tokens: 100, output_tokens: 200, cache_read_input_tokens: 50 },
+    });
+    const result = parseClaudeStreamJson(resultEvent);
+    expect(result.llmApiEmptyResponse).toBe(false);
+  });
 });
 
 describe("extractClaudeLoginUrl", () => {

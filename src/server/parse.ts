@@ -15,6 +15,10 @@ export function parseClaudeStreamJson(stdout: string) {
   // at the line level; this guard only needs to protect against the same
   // message block being parsed twice.
   const seenBlocks = new Set<string>();
+  // Set when we see stop_reason:null + output_tokens:0 on an assistant event
+  // with no subsequent result event — indicates the upstream LLM API returned
+  // an empty/malformed response (e.g. MiniMax degraded performance).
+  let llmApiEmptyResponse = false;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -34,6 +38,18 @@ export function parseClaudeStreamJson(stdout: string) {
       const message = parseObject(event.message);
       const messageId = asString(message.id, "");
       const content = Array.isArray(message.content) ? message.content : [];
+
+      // Detect empty LLM API response: stop_reason:null with zero output tokens.
+      // output_tokens may appear directly on message or nested under message.usage.
+      const stopReason = message.stop_reason;
+      const usageObj = parseObject(message.usage as Record<string, unknown>);
+      const outputTokens = typeof message.output_tokens === "number"
+        ? message.output_tokens
+        : asNumber(usageObj.output_tokens, -1);
+      if (stopReason === null && outputTokens === 0) {
+        llmApiEmptyResponse = true;
+      }
+
       for (let i = 0; i < content.length; i++) {
         const entry = content[i];
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
@@ -55,6 +71,7 @@ export function parseClaudeStreamJson(stdout: string) {
 
     if (type === "result") {
       finalResult = event;
+      llmApiEmptyResponse = false; // result event means Claude completed normally
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
     }
   }
@@ -67,6 +84,7 @@ export function parseClaudeStreamJson(stdout: string) {
       usage: null as UsageSummary | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
+      llmApiEmptyResponse,
     };
   }
 
@@ -87,6 +105,7 @@ export function parseClaudeStreamJson(stdout: string) {
     usage,
     summary,
     resultJson: finalResult,
+    llmApiEmptyResponse: false,
   };
 }
 
