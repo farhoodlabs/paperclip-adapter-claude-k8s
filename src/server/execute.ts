@@ -35,6 +35,13 @@ const POST_TERMINAL_KEEPALIVE_MS = 90_000;
 // against the K8s client library not propagating writable.destroy() into an
 // abort of the underlying HTTP request.
 const LOG_STREAM_BAIL_TIMEOUT_MS = 3_000;
+// After the log stream exits (container stopped producing output), wait this
+// long for the K8s Job condition to be confirmed before treating the job as
+// done.  K8s Job conditions can lag pod exit by several seconds or more under
+// cluster load.  Without this bound, waitForJobCompletion keeps polling while
+// streamPodLogs keeps reconnecting — together they can hold execute() open for
+// minutes, causing stale "running" status in the UI (FAR-23).
+const LOG_EXIT_COMPLETION_GRACE_MS = 30_000;
 
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
@@ -357,6 +364,11 @@ export async function streamPodLogsOnce(
  *
  * Capped at MAX_LOG_RECONNECT_ATTEMPTS to prevent infinite reconnect
  * loops during sustained API partitions.
+ *
+ * onFirstStreamExit is called the first time streamPodLogsOnce returns
+ * (container has exited or stream disconnected). Used by execute() to
+ * start the LOG_EXIT_COMPLETION_GRACE_MS grace timer (FAR-23) without
+ * waiting for all reconnects to exhaust.
  */
 async function streamPodLogs(
   namespace: string,
@@ -365,6 +377,7 @@ async function streamPodLogs(
   kubeconfigPath?: string,
   stopSignal?: { stopped: boolean },
   dedup?: LogLineDedupFilter,
+  onFirstStreamExit?: () => void,
 ): Promise<string> {
   const allChunks: string[] = [];
   let attempt = 0;
@@ -395,6 +408,9 @@ async function streamPodLogs(
 
     const preStreamTs = Math.floor(Date.now() / 1000);
     const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds, dedup, stopSignal);
+    // Signal first stream exit immediately so the grace-period timer in
+    // execute() can start without waiting for all reconnects to complete.
+    if (attempt === 0) onFirstStreamExit?.();
     if (result) {
       allChunks.push(result);
       // Update last-received timestamp to now (the stream just ended,
@@ -1063,12 +1079,56 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // reuse it and avoid pushing already-sent lines to the UI (finding #6, FAR-15).
     const logDedup = new LogLineDedupFilter();
 
-    const [logResult, completionResult] = await Promise.allSettled([
-      streamPodLogs(namespace, podName, wrappedOnLog, kubeconfigPath, logStopSignal, logDedup),
-      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then((r) => {
+    // Track when the log stream first exits so the grace-period can fire
+    // if the K8s Job condition lags behind container exit (FAR-23).
+    // Set via onFirstStreamExit callback (called after attempt=0 returns)
+    // rather than in .then() of streamPodLogs, which would create a
+    // deadlock: streamPodLogs only resolves after stopSignal is set, but
+    // stopSignal is set by the grace timer which needs logExitTime to be
+    // non-null.
+    let logExitTime: number | null = null;
+    const trackedLogStream = streamPodLogs(
+      namespace, podName, wrappedOnLog, kubeconfigPath, logStopSignal, logDedup,
+      () => { logExitTime = Date.now(); },
+    );
+
+    // completionWithGrace races waitForJobCompletion against a grace timer
+    // that fires LOG_EXIT_COMPLETION_GRACE_MS after the log stream exits.
+    // This bounds the stale-UI window when K8s Job conditions lag container
+    // exit (FAR-23): without it, waitForJobCompletion polls indefinitely
+    // while streamPodLogs reconnects, holding execute() open for minutes.
+    // logStopSignal.stopped is set on every settled path (fulfilled, rejected,
+    // or grace) so streamPodLogs stops reconnecting promptly.
+    type CompletionResult = { succeeded: boolean; timedOut: boolean; jobGone?: boolean };
+    let gracePoller: ReturnType<typeof setInterval> | null = null;
+    const completionWithGrace = new Promise<CompletionResult>((resolve, reject) => {
+      let settled = false;
+      const settleOk = (r: CompletionResult) => {
+        if (settled) return;
+        settled = true;
+        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
         logStopSignal.stopped = true;
-        return r;
-      }),
+        resolve(r);
+      };
+      const settleErr = (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
+        logStopSignal.stopped = true;
+        reject(err);
+      };
+      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then(settleOk).catch(settleErr);
+      gracePoller = setInterval(() => {
+        if (logExitTime !== null && Date.now() - logExitTime >= LOG_EXIT_COMPLETION_GRACE_MS) {
+          void onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update — proceeding with captured output (FAR-23)\n`).catch(() => {});
+          settleOk({ succeeded: false, timedOut: false, jobGone: true });
+        }
+      }, 1_000);
+    });
+
+    const [logResult, completionResult] = await Promise.allSettled([
+      trackedLogStream,
+      completionWithGrace,
     ]);
 
     // Stop the keepalive immediately once the job has reached a terminal

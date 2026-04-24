@@ -1102,6 +1102,95 @@ describe("execute: waitForPod edge cases", () => {
   });
 });
 
+// ─── execute: grace-period fallback (FAR-23) ─────────────────────────────────
+
+describe("execute: log-stream-exit grace period (FAR-23)", () => {
+  // Tests verify that execute() resolves within the grace window even when
+  // waitForJobCompletion keeps polling after the log stream exits (K8s
+  // condition propagation lag).
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
+    mockBatchPatchJob.mockResolvedValue({});
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
+    mockCoreListPods
+      .mockResolvedValueOnce({
+        items: [{
+          metadata: { name: "pod-abc" },
+          status: { phase: "Running", containerStatuses: [], initContainerStatuses: [] },
+        }],
+      })
+      .mockResolvedValue({
+        items: [{
+          metadata: { name: "pod-abc" },
+          status: { containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 0 } } }] },
+        }],
+      });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("resolves via grace (jobGone) when log stream exits but job condition never arrives", async () => {
+    // logApi.log returns immediately (container exited) — log stream exits on first attempt.
+    mockLogFn.mockImplementation(async () => {});
+    // One-shot read returns full Claude output (no reconnects needed for output)
+    mockCoreReadPodLog.mockResolvedValue(CLAUDE_HAPPY_OUTPUT);
+    // waitForJobCompletion never detects terminal — simulates K8s condition lag.
+    mockBatchReadJob.mockResolvedValue({ status: { conditions: [] } }); // never terminal
+
+    // No timeoutSec → completionTimeoutMs=0 → polls indefinitely without grace.
+    const executePromise = execute(makeCtx());
+
+    // Advance past:
+    //   ~4200ms of readPaperclipRuntimeSkillEntries real I/O (multiple small advances)
+    //   3100ms: streamPodLogs reconnect sleep (attempt=1, stopSignal still false at entry)
+    //   + 30100ms: grace period (LOG_EXIT_COMPLETION_GRACE_MS = 30s)
+    //   + 3100ms: streamPodLogs bail timer (stopSignal was set by grace → bail fires)
+    await vi.advanceTimersByTimeAsync(2_100);
+    await vi.advanceTimersByTimeAsync(1_100);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(3_100); // reconnect sleep
+    await vi.advanceTimersByTimeAsync(30_100); // grace fires
+    await vi.advanceTimersByTimeAsync(3_500); // bail timer + margin
+    const result = await executePromise;
+
+    // Grace fires → jobGone=true → execute proceeds with one-shot logs → success
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("sess_test123");
+    expect(mockCoreReadPodLog).toHaveBeenCalled();
+  }, 60_000);
+
+  it("resolves promptly via real completion when job condition arrives before grace", async () => {
+    // Log stream exits immediately then job condition arrives well within the grace period.
+    mockLogFn.mockImplementation(
+      async (_ns: string, _pod: string, _ctr: string, writable: import("node:stream").Writable) => {
+        writable.write(CLAUDE_HAPPY_OUTPUT);
+      },
+    );
+    // Job condition appears quickly (< 30s grace period)
+    mockBatchReadJob.mockResolvedValue({
+      status: { conditions: [{ type: "Complete", status: "True" }] },
+    });
+
+    const executePromise = execute(makeCtx());
+    await vi.advanceTimersByTimeAsync(3_100);
+    const result = await executePromise;
+
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("sess_test123");
+    // One-shot fallback should NOT be needed since the stream captured full output
+    // (grace did not fire, real completion arrived)
+    expect(result.errorMessage).toBeNull();
+  });
+});
+
 // ─── execute: concurrency guard — multiple orphan sorting ────────────────────
 
 describe("execute: concurrency guard — multiple orphans", () => {
