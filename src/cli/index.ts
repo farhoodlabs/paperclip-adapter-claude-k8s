@@ -1,1 +1,1 @@
-export { printClaudeStreamEvent, formatClaudeStreamLine } from "./format-event.js";
+export { printClaudeStreamEvent } from "./format-event.js";

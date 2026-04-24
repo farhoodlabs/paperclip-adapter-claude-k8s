@@ -52,4 +52,4 @@ Notes:
 `;
 
 export { createServerAdapter } from "./server/index.js";
-export { printClaudeStreamEvent, formatClaudeStreamLine } from "./cli/index.js";
+export { printClaudeStreamEvent } from "./cli/index.js";
