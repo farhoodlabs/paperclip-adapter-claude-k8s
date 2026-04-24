@@ -26,10 +26,6 @@ const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_STREAM_RECONNECT_DELAY_MS = 3_000;
 const MAX_LOG_RECONNECT_ATTEMPTS = 50;
-// How long to keep refreshing onSpawn after the Job reaches a terminal state.
-// Covers the cleanup path (delete job, parse stdout) so a slow K8s API call
-// doesn't trip the 5-minute reaper staleness window.
-const POST_TERMINAL_KEEPALIVE_MS = 90_000;
 // Upper bound on how long streamPodLogsOnce will wait after stopSignal fires
 // before force-returning, even if logApi.log has not yet resolved.  Defensive
 // against the K8s client library not propagating writable.destroy() into an
@@ -932,16 +928,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
       }
 
-      // Notify the server that execution has started.  This sets
-      // processStartedAt and refreshes updatedAt in the DB, which the
-      // stale-run reaper (reapOrphanedRuns) uses to decide liveness.
-      if (ctx.onSpawn) {
-        await ctx.onSpawn({
-          pid: process.pid,     // Paperclip server PID — always alive while adapter runs in-process
-          processGroupId: null,
-          startedAt: new Date().toISOString(),
-        });
-      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const phase = reattachTarget ? "reattach" : "scheduling";
@@ -964,49 +950,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Keepalive: periodically send a status line via onLog so the
     // Paperclip server knows the adapter is still alive even when the
     // pod produces no output (e.g. Claude is in a long thinking phase).
-    //
-    // IMPORTANT: onLog alone does NOT update the run's updatedAt in the
-    // DB — it only appends to the log store and publishes SSE events.
-    // The stale-run reaper checks updatedAt, so we must also call
-    // onSpawn periodically to refresh it.  Without this, multi-instance
-    // deployments can reap a live run from another server instance
-    // after the 5-minute staleness window.
-    //
-    // BUT: the keepalive must NEVER refresh updatedAt if the underlying
-    // K8s Job is already terminal.  Otherwise, if execute() stalls after
-    // the pod finishes (e.g. a slow K8s API call, a hung log stream
-    // drain, or a Job whose Complete condition lags pod termination),
-    // we would keep the run marked "alive" indefinitely while the pod
-    // is actually gone — the exact "UI thinks jobs are running when
-    // they are not" bug.  We verify Job liveness every tick and stop
-    // refreshing as soon as the Job reaches a terminal state; if
-    // execute() is truly stuck, the reaper will then catch it within
-    // the normal 5-minute staleness window.
     let lastLogAt = Date.now();
-    let keepaliveTick = 0;
     let keepaliveJobTerminal = false;
-    let keepaliveJobTerminalAt: number | null = null;
     let consecutiveTerminalReadings = 0;
     keepaliveTimer = setInterval(() => {
       // Fire-and-forget the async work; setInterval callbacks must be
       // synchronous or the timer will drift.
       void (async () => {
-        if (keepaliveJobTerminal) {
-          // Post-terminal window: keep refreshing onSpawn during cleanup
-          // (job deletion, log parsing, K8s API calls) so the reaper doesn't
-          // fire a false process_lost while execute() is still running.
-          if (
-            ctx.onSpawn &&
-            keepaliveJobTerminalAt !== null &&
-            Date.now() - keepaliveJobTerminalAt <= POST_TERMINAL_KEEPALIVE_MS
-          ) {
-            keepaliveTick++;
-            if (keepaliveTick % 6 === 0) {
-              void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
-            }
-          }
-          return;
-        }
+        if (keepaliveJobTerminal) return;
 
         // Verify the Job is still alive before announcing or refreshing.
         // Require two consecutive terminal readings before latching to
@@ -1021,16 +972,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             consecutiveTerminalReadings++;
             if (consecutiveTerminalReadings >= 2) {
               keepaliveJobTerminal = true;
-              keepaliveJobTerminalAt = Date.now();
-              if (ctx.onSpawn) {
-                void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
-              }
-              return;
-            }
-            // First terminal reading — do not latch yet; next tick confirms.
-            keepaliveTick++;
-            if (ctx.onSpawn && (keepaliveTick === 1 || keepaliveTick % 12 === 0)) {
-              void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
             }
             return;
           }
@@ -1042,10 +983,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // window as a safety net.
           if (isK8s404(err)) {
             keepaliveJobTerminal = true;
-            keepaliveJobTerminalAt = Date.now();
-            if (ctx.onSpawn) {
-              void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
-            }
             return;
           }
           // Log transient errors but leave keepaliveJobTerminal false so
@@ -1057,14 +994,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
         const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
         void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`).catch(() => {});
-
-        // Refresh updatedAt every ~3 minutes (12 ticks × 15s = 180s) to
-        // stay well within the 5-minute reaper staleness window.  Also
-        // fire on tick 1 for an early safety margin after job start.
-        keepaliveTick++;
-        if (ctx.onSpawn && (keepaliveTick === 1 || keepaliveTick % 12 === 0)) {
-          void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
-        }
       })();
     }, KEEPALIVE_INTERVAL_MS);
     const wrappedOnLog: typeof onLog = async (stream, chunk) => {
@@ -1132,9 +1061,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ]);
 
     // Stop the keepalive immediately once the job has reached a terminal
-    // state — do not wait for the finally block.  Any K8s API call or
-    // cleanup that happens after this point should not keep the run
-    // marked "alive" in the DB via onSpawn refreshes.
+    // state — do not wait for the finally block.
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);
       keepaliveTimer = null;
