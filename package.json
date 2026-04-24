@@ -1,6 +1,6 @@
 {
   "name": "paperclip-adapter-claude-k8s",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "description": "Paperclip adapter plugin that runs Claude Code agents as Kubernetes Jobs",
   "license": "MIT",
   "repository": {
