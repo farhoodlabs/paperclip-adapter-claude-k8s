@@ -150,10 +150,10 @@ describe("buildPartialRunError", () => {
     expect(buildPartialRunError(null, "", "")).toBe("Claude exited with code -1");
   });
 
-  it("skips system/init events and returns generic message when only init captured", () => {
+  it("returns init-only message when stdout is init-only with non-zero exit code (FAR-101)", () => {
     const msg = buildPartialRunError(1, "claude-sonnet-4-6", initLine);
     expect(msg).toBe(
-      "Claude started but did not produce a result (model: claude-sonnet-4-6) — check API credentials, model support, and adapter config",
+      "Claude exited immediately after init (model: claude-sonnet-4-6) (exit code 1) — the model may be unsupported or the session may have been rejected before producing output",
     );
   });
 
@@ -170,15 +170,15 @@ describe("buildPartialRunError", () => {
     expect(msg).toBe("Claude exited with code 1: Error: no API key configured");
   });
 
-  it("skips result events (structured protocol artefact — not surfaced verbatim)", () => {
+  it("returns init-only message when stdout has init + result event but no plain content (structured artefact, not surfaced verbatim)", () => {
     // In production, buildPartialRunError is only called when parseClaudeStreamJson
     // returns null (no result event).  If somehow a result event appears here, the
-    // raw JSON blob must not be shown — the "did not produce a result" message is
-    // cleaner and avoids leaking protocol internals to the UI.
+    // raw JSON blob must not be shown — the init-only message is cleaner and avoids
+    // leaking protocol internals to the UI.
     const resultLike = JSON.stringify({ type: "result", subtype: "error", result: "rate limit" });
     const stdout = [initLine, resultLike].join("\n");
     const msg = buildPartialRunError(2, "claude-sonnet-4-6", stdout);
-    expect(msg).toContain("did not produce a result");
+    expect(msg).toContain("Claude exited immediately after init");
     expect(msg).toContain("claude-sonnet-4-6");
     expect(msg).not.toMatch(/\{.*type.*result/);
   });

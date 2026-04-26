@@ -110,24 +110,12 @@ export function shouldAbortForCancellation(runStatus: string | undefined): boole
 }
 
 /**
- * Build the error message when Claude's stdout contains no result event.
- * Skips system/init event lines so the UI doesn't display the raw init JSON.
- * Exported for unit tests.
+ * Returns the first non-JSON/plain-text line in stdout, treating JSON objects
+ * with a "type" field as protocol artefacts and skipping them.
+ * Used by buildPartialRunError to detect init-only runs.
  */
-export function buildPartialRunError(
-  exitCode: number | null,
-  model: string,
-  stdout: string,
-): string {
-  if (exitCode === 0) return "Failed to parse Claude JSON output";
-
-  // Walk stdout lines and skip every structured streaming event (any JSON
-  // object that carries a non-empty "type" field: system, assistant, user,
-  // rate_limit_event, result, …).  All of these are protocol artefacts and
-  // produce confusing raw-JSON blobs when surfaced verbatim as an error
-  // message.  Only plain-text lines (non-JSON, or JSON without a type field)
-  // are treated as human-readable content worth including in the error.
-  const firstContentLine = stdout.split(/\r?\n/)
+function firstContentLine(stdout: string): string {
+  return stdout.split(/\r?\n/)
     .map((l) => l.trim())
     .find((l) => {
       if (!l) return false;
@@ -142,19 +130,55 @@ export function buildPartialRunError(
       }
       return true;
     }) ?? "";
+}
+
+/**
+ * Returns true when stdout contains only init/system/assistant events from the
+ * given model with no human-readable content lines.  Used to detect init-only
+ * non-zero-exit runs that should be classified as claude_init_failed rather than
+ * the generic "Claude exited with code N" message.
+ */
+function isInitOnlyRun(model: string, stdout: string): boolean {
+  if (!stdout.trim() || !model) return false;
+  const content = firstContentLine(stdout);
+  if (content) return false;
+  // Check that at least the init event for this model was seen
+  const hasModelInit = stdout.includes(`"model":"${model}"`) || stdout.includes(`"model":"${model.replace(/-/g, "_")}"`);
+  return hasModelInit;
+}
+
+/**
+ * Build the error message when Claude's stdout contains no result event.
+ * Skips system/init event lines so the UI doesn't display the raw init JSON.
+ * Exported for unit tests.
+ */
+export function buildPartialRunError(
+  exitCode: number | null,
+  model: string,
+  stdout: string,
+): string {
+  if (exitCode === 0) return "Failed to parse Claude JSON output";
 
   // If the stream contained only structured events with no plain-text output,
   // surface the model name so the operator can diagnose missing credentials
   // or unsupported/misconfigured model.
-  const initOnlyOutput = stdout.trim() !== "" && model !== "" && !firstContentLine;
+  const contentLine = firstContentLine(stdout);
+  if (contentLine) {
+    return `Claude exited with code ${exitCode ?? -1}: ${contentLine}`;
+  }
+
+  if (isInitOnlyRun(model, stdout) && (exitCode ?? 0) !== 0) {
+    const modelHint = model ? ` (model: ${model})` : "";
+    return `Claude exited immediately after init${modelHint} (exit code ${exitCode ?? -1}) — the model may be unsupported or the session may have been rejected before producing output`;
+  }
+
+  const initOnlyOutput = stdout.trim() !== "" && model !== "";
   if (initOnlyOutput) {
     const modelHint = model ? ` (model: ${model})` : "";
     return `Claude started but did not produce a result${modelHint} — check API credentials, model support, and adapter config`;
   }
 
-  return firstContentLine
-    ? `Claude exited with code ${exitCode ?? -1}: ${firstContentLine}`
-    : `Claude exited with code ${exitCode ?? -1}`;
+  return `Claude exited with code ${exitCode ?? -1}`;
 }
 
 export type OrphanClassification =
