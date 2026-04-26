@@ -574,6 +574,27 @@ async function waitForJobCompletion(
  * Get the exit code from the Job's pod.
  */
 async function getPodExitCode(namespace: string, jobName: string, kubeconfigPath?: string): Promise<number | null> {
+  const state = await getPodTerminatedState(namespace, jobName, kubeconfigPath);
+  return state?.exitCode ?? null;
+}
+
+/**
+ * Get the claude container's terminated state (exit code, reason, message,
+ * signal) from the Job's pod. Returns null if the pod or container is gone.
+ * Used by the no-result error path to explain *why* a run was truncated.
+ */
+export interface PodTerminatedState {
+  exitCode: number | null;
+  reason: string | null;
+  message: string | null;
+  signal: number | null;
+}
+
+async function getPodTerminatedState(
+  namespace: string,
+  jobName: string,
+  kubeconfigPath?: string,
+): Promise<PodTerminatedState | null> {
   const coreApi = getCoreApi(kubeconfigPath);
   const podList = await coreApi.listNamespacedPod({
     namespace,
@@ -583,7 +604,40 @@ async function getPodExitCode(namespace: string, jobName: string, kubeconfigPath
   if (!pod) return null;
 
   const containerStatus = pod.status?.containerStatuses?.find((s) => s.name === "claude");
-  return containerStatus?.state?.terminated?.exitCode ?? null;
+  const terminated = containerStatus?.state?.terminated;
+  if (!terminated) return null;
+  return {
+    exitCode: terminated.exitCode ?? null,
+    reason: terminated.reason ?? null,
+    message: (terminated.message ?? "").trim() || null,
+    signal: terminated.signal ?? null,
+  };
+}
+
+/**
+ * Format a human-readable explanation for a truncated run, including the
+ * pod's claude-container terminated state when available. Exit code 137
+ * is annotated as SIGKILL/OOM since that is the most common cause.
+ * Exported for unit tests.
+ */
+export function describeTruncationCause(
+  state: PodTerminatedState | null,
+): string {
+  if (!state) {
+    return "pod state unavailable — likely deleted before exit could be read";
+  }
+  const parts: string[] = [];
+  if (state.exitCode !== null) {
+    parts.push(`exit code ${state.exitCode}`);
+    if (state.exitCode === 137) parts.push("SIGKILL (commonly OOMKilled)");
+    else if (state.exitCode === 143) parts.push("SIGTERM");
+  } else {
+    parts.push("no exit code");
+  }
+  if (state.signal !== null) parts.push(`signal ${state.signal}`);
+  if (state.reason) parts.push(`reason=${state.reason}`);
+  if (state.message) parts.push(`message=${state.message}`);
+  return parts.join(", ");
 }
 
 /**
@@ -998,6 +1052,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   let stdout = "";
   let exitCode: number | null = null;
+  let podTerminatedState: PodTerminatedState | null = null;
   let jobTimedOut = false;
   let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   // Set when we return a mismatch error so the finally block knows not to
@@ -1297,7 +1352,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
-    exitCode = await getPodExitCode(namespace, jobName, kubeconfigPath);
+    podTerminatedState = await getPodTerminatedState(namespace, jobName, kubeconfigPath);
+    exitCode = podTerminatedState?.exitCode ?? null;
   } finally {
     if (keepaliveTimer) clearInterval(keepaliveTimer);
     activeJobs.delete(activeJobRef);
@@ -1368,13 +1424,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
     if (parsedStream.truncatedMidStream) {
-      const exitHint = exitCode === null ? "no exit code" : `exit code ${exitCode}`;
+      const cause = describeTruncationCause(podTerminatedState);
       const modelHint = parsedStream.model ? ` (model: ${parsedStream.model})` : "";
       return {
         exitCode,
         signal: null,
         timedOut: false,
-        errorMessage: `Claude run was truncated mid-stream${modelHint} — assistant produced content but no result event arrived (${exitHint}); pod may have been terminated, OOMKilled, or the CLI crashed`,
+        errorMessage: `Claude run was truncated mid-stream${modelHint} — assistant produced content but no result event arrived; ${cause}`,
         errorCode: "claude_truncated",
         resultJson: { stdout },
       };

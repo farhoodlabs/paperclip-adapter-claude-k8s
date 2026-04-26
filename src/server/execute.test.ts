@@ -60,7 +60,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   });
 });
 
-const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, streamPodLogsOnce, shouldAbortForCancellation, execute } = await import("./execute.js");
+const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, describeTruncationCause, streamPodLogsOnce, shouldAbortForCancellation, execute } = await import("./execute.js");
 
 function makeJob(opts: {
   runId?: string;
@@ -359,6 +359,33 @@ describe("describePodTerminatedError", () => {
     const msg = describePodTerminatedError("mypod", "Failed", cs);
     expect(msg).toContain("unknown");
     expect(msg).toContain("Error");
+  });
+});
+
+describe("describeTruncationCause", () => {
+  it("annotates exit code 137 as SIGKILL/OOM", () => {
+    const msg = describeTruncationCause({ exitCode: 137, reason: "OOMKilled", message: "Memory cgroup out of memory", signal: null });
+    expect(msg).toContain("exit code 137");
+    expect(msg).toContain("SIGKILL");
+    expect(msg).toContain("OOMKilled");
+    expect(msg).toContain("Memory cgroup out of memory");
+  });
+
+  it("annotates exit code 143 as SIGTERM", () => {
+    const msg = describeTruncationCause({ exitCode: 143, reason: null, message: null, signal: null });
+    expect(msg).toContain("exit code 143");
+    expect(msg).toContain("SIGTERM");
+  });
+
+  it("falls back to 'pod state unavailable' when state is null", () => {
+    const msg = describeTruncationCause(null);
+    expect(msg).toContain("pod state unavailable");
+  });
+
+  it("emits 'no exit code' when exitCode is null but state exists", () => {
+    const msg = describeTruncationCause({ exitCode: null, reason: "Error", message: null, signal: null });
+    expect(msg).toContain("no exit code");
+    expect(msg).toContain("reason=Error");
   });
 });
 
@@ -1019,7 +1046,7 @@ describe("execute: happy path", () => {
       },
     );
     mockCoreListPods.mockResolvedValue({
-      items: [{ metadata: { name: "pod-abc" }, status: { containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 137 } } }] } }],
+      items: [{ metadata: { name: "pod-abc" }, status: { containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 137, reason: "OOMKilled", message: "Memory cgroup out of memory" } } }] } }],
     });
 
     const executePromise = execute(makeCtx());
@@ -1030,6 +1057,9 @@ describe("execute: happy path", () => {
     expect(result.errorMessage).toContain("truncated mid-stream");
     expect(result.errorMessage).toContain("claude-opus-4-7");
     expect(result.errorMessage).toContain("exit code 137");
+    expect(result.errorMessage).toContain("SIGKILL");
+    expect(result.errorMessage).toContain("OOMKilled");
+    expect(result.errorMessage).toContain("Memory cgroup out of memory");
   });
 
   it("reconnects log stream and logs status when job completion takes > 3s", async () => {
