@@ -1771,7 +1771,7 @@ describe("execute: SIGTERM handler best-effort cleanup", () => {
     vi.useRealTimers();
   });
 
-  it("deletes the active Job when SIGTERM fires during execution", async () => {
+  it("does NOT delete active Jobs on SIGTERM — leaves them for orphan reattach (FAR-107)", async () => {
     // Mock process.kill to prevent the test process from actually being killed.
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
@@ -1782,17 +1782,19 @@ describe("execute: SIGTERM handler best-effort cleanup", () => {
     // Flush microtasks through the async setup chain: getSelfPodInfo, listJobs,
     // readSkillEntries, prepareBundle, createJob, onLog, activeJobs.add(), and
     // ensureSigtermHandler() all complete before the try block enters streaming.
-    // 30 rounds is more than enough for the ~7 sequential await points.
     for (let i = 0; i < 30; i++) await Promise.resolve();
 
-    // Emit SIGTERM — the process.once handler fires synchronously and kicks off
-    // async cleanup (deleteNamespacedJob). The mock resolves immediately.
+    // Reset deleteJob spy after setup so we can detect any SIGTERM-driven calls.
+    mockBatchDeleteJob.mockClear();
+
+    // Emit SIGTERM — the handler must re-raise to the default handler without
+    // touching the K8s Job.  Deleting the Job here would surface as
+    // k8s_job_deleted_externally in the in-flight run (FAR-107).
     process.emit("SIGTERM");
 
-    // Flush microtasks for deleteJob to resolve and the .then(process.kill) to run.
     for (let i = 0; i < 10; i++) await Promise.resolve();
 
-    expect(mockBatchDeleteJob).toHaveBeenCalled();
+    expect(mockBatchDeleteJob).not.toHaveBeenCalled();
     expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGTERM");
 
     killSpy.mockRestore();

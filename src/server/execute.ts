@@ -58,30 +58,20 @@ function ensureSigtermHandler(): void {
   if (sigtermHandlerRegistered) return;
   sigtermHandlerRegistered = true;
   process.once("SIGTERM", () => {
-    const jobs = [...activeJobs];
-    void Promise.allSettled(
-      jobs.map(async (ref) => {
-        try {
-          const batchApi = getBatchApi(ref.kubeconfigPath);
-          await batchApi.deleteNamespacedJob({
-            name: ref.jobName,
-            namespace: ref.namespace,
-            body: { propagationPolicy: "Background" },
-          });
-        } catch { /* best-effort */ }
-        if (ref.promptSecretName && ref.promptSecretNamespace) {
-          try {
-            const coreApi = getCoreApi(ref.kubeconfigPath);
-            await coreApi.deleteNamespacedSecret({
-              name: ref.promptSecretName,
-              namespace: ref.promptSecretNamespace,
-            });
-          } catch { /* best-effort */ }
-        }
-      }),
-    ).then(() => {
-      process.kill(process.pid, "SIGTERM");
-    });
+    // Do NOT delete active K8s Jobs on SIGTERM (FAR-107).  Paperclip itself
+    // receives SIGTERM during rolling deploys, evictions, scale-down, etc.
+    // Deleting the Jobs we own there causes the in-flight heartbeat to surface
+    // a false-positive `k8s_job_deleted_externally` error and tears down work
+    // the user expected to keep running.
+    //
+    // The correct behaviour with `reattachOrphanedJobs=true` (default) is to
+    // leave the Jobs alive: the next paperclip process discovers them via the
+    // orphan-classification path and reattaches their log streams.  When
+    // `reattachOrphanedJobs=false` the operator explicitly opted into manual
+    // cleanup and should not have us auto-deleting either.  The owning Job's
+    // ownerReference (FAR-15) keeps the prompt Secret tied to the Job, so
+    // both survive together and TTL cleans them up after natural completion.
+    process.kill(process.pid, "SIGTERM");
   });
 }
 
