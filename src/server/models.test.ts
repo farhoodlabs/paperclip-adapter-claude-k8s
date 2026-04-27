@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { listK8sModels } from "./models.js";
+import { listK8sModels, DIRECT_MODELS, BEDROCK_MODELS } from "./models.js";
 
 describe("listK8sModels", () => {
   const savedEnv: Record<string, string | undefined> = {};
@@ -48,5 +48,24 @@ describe("listK8sModels", () => {
     process.env.ANTHROPIC_BEDROCK_BASE_URL = "   ";
     const models = await listK8sModels();
     expect(models.some((m) => m.id === "claude-opus-4-7")).toBe(true);
+  });
+});
+
+describe("static model lists", () => {
+  it("DIRECT_MODELS is non-empty and has valid ids", () => {
+    expect(DIRECT_MODELS.length).toBeGreaterThan(0);
+    for (const m of DIRECT_MODELS) {
+      expect(typeof m.id).toBe("string");
+      expect(m.id.length).toBeGreaterThan(0);
+      expect(typeof m.label).toBe("string");
+    }
+  });
+
+  it("BEDROCK_MODELS is non-empty and all ids contain 'anthropic.'", () => {
+    expect(BEDROCK_MODELS.length).toBeGreaterThan(0);
+    for (const m of BEDROCK_MODELS) {
+      expect(m.id).toContain("anthropic.");
+      expect(typeof m.label).toBe("string");
+    }
   });
 });
