@@ -301,8 +301,7 @@ describe("buildJobManifest", () => {
       const init = job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.command?.[0]).toBe("sh");
       expect(init?.command?.[1]).toBe("-c");
-      expect(init?.command?.[2]).toContain("mkdir -p /paperclip/instances/default/run-logs/");
-      expect(init?.command?.[2]).toContain("printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt");
+      expect(init?.command?.[2]).toBe("printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt");
     });
 
     it("write-prompt mounts prompt volume", () => {
@@ -808,28 +807,26 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
       expect(cmd).toContain("| tee");
-      expect(cmd).toContain("/paperclip/instances/default/run-logs/");
+      expect(cmd).toContain("/paperclip/instances/default/data/run-logs/");
     });
 
     it("podLogPath is returned from buildJobManifest", () => {
       const result = buildJobManifest({ ctx, selfPod });
       expect(result.podLogPath).toBe(
-        "/paperclip/instances/default/run-logs/co1/agent-abc/run-abc12345.pod.ndjson",
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/run-abc12345.pod.ndjson",
       );
     });
 
     it("buildPodLogPath returns correctly formatted path", () => {
       expect(buildPodLogPath("co1", "agent-abc", "run-abc12345")).toBe(
-        "/paperclip/instances/default/run-logs/co1/agent-abc/run-abc12345.pod.ndjson",
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/run-abc12345.pod.ndjson",
       );
     });
 
-    it("init container creates log directory", () => {
+    it("init container does not create log directory (server pre-creates it on shared PVC)", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const initCmd = job.spec?.template?.spec?.initContainers?.[0]?.command;
-      expect(initCmd?.[0]).toBe("sh");
-      expect(initCmd?.[1]).toBe("-c");
-      expect(initCmd?.[2]).toContain("mkdir -p /paperclip/instances/default/run-logs/");
+      expect(initCmd?.[2]).not.toContain("mkdir -p /paperclip");
     });
 
     it("sanitizes companyId with / to valid path component for log path", () => {
