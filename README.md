@@ -1,3 +1,5 @@
+> **Abandoned** — This adapter is no longer maintained. The Kubernetes execution capability has moved to the sandbox plugin at [`farhoodlabs/paperclip-plugin-k8s`](https://github.com/farhoodlabs/paperclip-plugin-k8s) (`@farhoodlabs/paperclip-plugin-k8s` on npm).
+
 # Claude (Kubernetes) Paperclip Adapter Plugin
 
 Paperclip adapter plugin that runs Claude Code agents as isolated Kubernetes Jobs instead of inside the main Paperclip process.
